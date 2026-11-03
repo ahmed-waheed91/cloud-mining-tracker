@@ -1,0 +1,10 @@
+# Personal data — never publish
+data/
+reports/
+backups/
+*.json
+!manifest.webmanifest
+*.csv
+
+# Notes for local Claude sessions (contain personal details)
+CLAUDE.md

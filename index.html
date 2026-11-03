@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cloud Mining Tracker</title>
+<meta name="description" content="Track BTC cloud-mining contracts, reinvestments and payouts. Your data stays on your own computer.">
+<meta name="theme-color" content="#e07b1a">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<link rel="stylesheet" href="app.css">
+<script src="vendor/chart.umd.min.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand" title="Cloud Mining Tracker">₿ Cloud Mining Tracker <span id="version" class="version"></span></div>
+  <nav class="tabs" id="tabs">
+    <button data-tab="overview" class="active">Overview</button>
+    <button data-tab="contracts">Contracts</button>
+    <button data-tab="history">History</button>
+    <button data-tab="projection">Projection</button>
+    <button data-tab="money">Money in &amp; out</button>
+    <button data-tab="settings">Settings</button>
+  </nav>
+  <div class="spacer"></div>
+  <label class="scope">View
+    <select id="scope"></select>
+  </label>
+  <div class="seg" data-pref="unit" title="Show amounts in BTC or satoshis"><button data-v="btc">BTC</button><button data-v="sats">sats</button></div>
+  <div class="seg" data-pref="currency" title="Currency shown next to BTC amounts"><button data-v="USD">USD</button><button data-v="AED">AED</button></div>
+  <div class="price" id="price">BTC —</div>
+  <div class="file-chip" id="fileChip" hidden></div>
+  <button id="importBtn" class="primary">Import reports</button>
+  <input id="importInput" type="file" accept=".csv" multiple hidden>
+</header>
+
+<div id="fileBanner" class="banner" hidden></div>
+
+<main id="main"></main>
+
+<div id="dropzone" class="dropzone" hidden><div>Drop report CSVs to import</div></div>
+<div id="toasts" class="toasts"></div>
+
+<script src="app.js"></script>
+</body>
+</html>
