@@ -4,7 +4,7 @@
 // Data lives in a folder the user picks (File System Access API, Chrome): cloud-mining.json
 // plus daily backups. It is mirrored to localStorage so nothing is lost while disconnected.
 
-const APP_VERSION = '1.1.0';
+const APP_VERSION = '1.2.0';
 const DATA_VERSION = 2;
 const STORAGE_KEY = 'cloud-mining-data';
 const PREFS_KEY = 'cloud-mining-prefs';
@@ -1120,6 +1120,7 @@ function renderSettings() {
       <button data-act="export">Export backup</button>
       <button data-act="import-backup">Restore backup…</button>
       <input id="backupInput" type="file" accept=".json" hidden>
+      <button class="danger" data-act="reset">Reset all data…</button>
     </div>
   </div>
 
@@ -1277,11 +1278,68 @@ async function reconnect() {
   } catch (e) { toast(e.message, true); }
   render();
 }
-function exportBackup() {
+// Reset: move the data file and backups/ into resets/reset-YYYY-MM-DD_HHMM/ (with a note saying what
+// was in it), then start empty. Without a folder, the current data is downloaded instead.
+async function resetData() {
+  const counts = `${plural(data.purchases.length, 'contract')}, ${plural(new Set(data.earnings.map(e => e.date)).size, 'day')} of earnings, ${plural(data.payouts.length, 'payout')}, ${plural(data.cycles.length, 'cycle')} and ${plural(data.deposits.length, 'deposit')}`;
+  const where = fileState === 'connected'
+    ? `${DATA_FILE} and its backups will be moved to ${dirHandle.name}\\resets\\ in a folder named after today's date and time.`
+    : 'A copy of the current data will be downloaded first.';
+  if (!confirm(`Reset all data and start fresh?\n\nThis clears ${counts}. ${where}\n\nYour display settings are kept.`)) return;
+  const now = new Date();
+  const stamp = `${todayIso()}_${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}`;
+  try {
+    if (fileState === 'connected') {
+      clearTimeout(saveTimer);
+      await writeChain;
+      const resets = await dirHandle.getDirectoryHandle('resets', { create: true });
+      let name = `reset-${stamp}`;
+      for (let i = 2; await resets.getDirectoryHandle(name).then(() => true, () => false); i++) name = `reset-${stamp}-${i}`;
+      const dest = await resets.getDirectoryHandle(name, { create: true });
+      await writeText(dest, 'about-this-reset.txt', `Reset on ${now.toString()} by Cloud Mining Tracker ${APP_VERSION}.\r\nThis folder holds the data file and backups as they were just before the reset: ${counts}.\r\nTo go back to this data, use Settings > Restore backup and pick the ${DATA_FILE} in this folder.\r\n`);
+      try { await moveFile(dirHandle, DATA_FILE, dest); } catch (e) { if (e.name !== 'NotFoundError') throw e; }
+      try {
+        const src = await dirHandle.getDirectoryHandle('backups');
+        const bdest = await dest.getDirectoryHandle('backups', { create: true });
+        const names = [];
+        for await (const [n, h] of src.entries()) if (h.kind === 'file') names.push(n);
+        for (const n of names) await moveFile(src, n, bdest);
+        await dirHandle.removeEntry('backups'); // empty now; fails safely if anything was left
+      } catch (e) { if (e.name !== 'NotFoundError') throw e; }
+      toast(`Data reset. The old data is in ${dirHandle.name}\\resets\\${name}`);
+    } else {
+      exportBackup(`cloud-mining-before-reset-${stamp}.json`);
+      toast('Data reset. A copy of the old data was downloaded.');
+    }
+  } catch (e) {
+    toast('Reset stopped, nothing was cleared: ' + e.message, true);
+    return;
+  }
+  data = emptyData();
+  currentScope = null;
+  editing = null;
+  backupDoneFor = null;
+  backupCount = 0;
+  currentTab = 'overview';
+  save();
+  render();
+}
+async function writeText(dir, name, text) {
+  const w = await (await dir.getFileHandle(name, { create: true })).createWritable();
+  await w.write(text);
+  await w.close();
+}
+// Copy then delete, which works in every browser with folder access (FileSystemHandle.move() doesn't yet).
+async function moveFile(fromDir, name, toDir) {
+  const text = await (await (await fromDir.getFileHandle(name)).getFile()).text();
+  await writeText(toDir, name, text);
+  await fromDir.removeEntry(name);
+}
+function exportBackup(filename) {
   const blob = new Blob([JSON.stringify(data, null, 1)], { type: 'application/json' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
-  a.download = `cloud-mining-backup-${todayIso()}.json`;
+  a.download = filename || `cloud-mining-backup-${todayIso()}.json`;
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 }
@@ -1356,6 +1414,7 @@ function bind() {
     if (act === 'open-folder') openFolder();
     else if (act === 'reconnect') reconnect();
     else if (act === 'export') exportBackup();
+    else if (act === 'reset') { resetData(); return; }
     else if (act === 'import') $('#importInput').click();
     else if (act === 'import-backup') $('#backupInput').click();
     else if (act === 'dismiss-import') { data.lastImport = null; save(); render(); }
