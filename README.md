@@ -27,7 +27,8 @@ Re-import whenever you like. Rows are refreshed, never doubled, and reinvestment
 - Return per day, per 30 days and per year in BTC, for the last 7 days, last 30 days and the whole cycle
 - Profit split into bonus and mining, and loss days
 - Monthly summary, daily history, and each contract's price, USD cost and margin
-- Projections that simulate the contract loop day by day: stop reinvesting, reinvest capital, or reinvest some or all of the profit, with your reinvest and withdraw thresholds
+- Your platform's auto-reinvest and auto-payout settings per cycle: reinvest from capital, profit or both in whole blocks (min 100 TH/s), and pay out at a set amount (min 0.001 BTC)
+- Projections that simulate the platform's loop day by day for each reinvest option, plus a block-size comparison showing how often blocks get bought, how much waits, and what bigger blocks cost you in profit
 - Deposits paid in USDT, taken straight from your purchase orders
 - Warnings for missing reports, stale data, loss streaks and bonus changes
 - Amounts in BTC or sats, with USD or AED alongside

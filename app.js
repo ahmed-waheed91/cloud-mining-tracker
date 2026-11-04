@@ -4,7 +4,7 @@
 // Data lives in a folder the user picks (File System Access API, Chrome): cloud-mining.json
 // plus daily backups. It is mirrored to localStorage so nothing is lost while disconnected.
 
-const APP_VERSION = '1.4.0';
+const APP_VERSION = '1.5.0';
 const DATA_VERSION = 2;
 const STORAGE_KEY = 'cloud-mining-data';
 const PREFS_KEY = 'cloud-mining-prefs';
@@ -25,7 +25,8 @@ let editing = null; // {type: 'deposit'|'check', id} while a row is being edited
 let groupDaily = true;
 const collapsedMonths = new Set();
 const sortState = {};
-const proj = { capital: null, per30: null, reinvestAt: null, withdrawAt: null, days: 365, custom: 75 }; // null = use current figures
+const proj = { capital: null, per30: null, blockTh: null, blockPrice: null, payoutAt: null, days: 365 }; // null = use current figures
+const resetProj = () => Object.assign(proj, { capital: null, per30: null, blockTh: null, blockPrice: null, payoutAt: null });
 const charts = {};
 
 let prefs = { unit: 'btc', currency: 'USD', theme: 'auto' };
@@ -44,7 +45,7 @@ function applyTheme() {
 function emptyData() {
   return {
     version: DATA_VERSION, savedAt: null,
-    cycles: [],        // {id, name, start, reinvestThreshold, withdrawThreshold, notes}
+    cycles: [],        // {id, name, start, notes, reinvestFrom, blockTh, blockPrice, blockPriceDate, payoutFrom, withdrawThreshold (payout amount); old reinvestThreshold is no longer used}
     deposits: [],      // {id, cycleId, date, btc, kind: 'new'|'carry', note}
     balanceChecks: [], // {id, date, btc, note}
     purchases: [],     // from hashrate-purchases report, one per order #
@@ -486,34 +487,60 @@ function warnings(R) {
   return out;
 }
 
-// Day-by-day model of the real loop. Each contract pays back 1/30 of its price plus profit every day for 30 days.
-// What is set aside for reinvesting buys a new contract once it reaches `reinvestAt`; the rest is withdrawn at `withdrawAt`.
-// share = part of the profit reinvested; share = null means stop reinvesting (capital is withdrawn too).
-function simulate({ contracts, balance, rate, days, share, reinvestAt, withdrawAt }) {
-  const stop = share == null;
+// ---------- platform auto-reinvest and payout ----------
+const MIN_BLOCK_TH = 100;  // the platform's smallest reinvest block
+const MIN_PAYOUT = 0.001;  // the platform's smallest payout, BTC
+const REINVEST_FROM = { off: 'Off', capital: 'Capital only', profit: 'Profit only', both: 'Capital and profit' };
+const PAYOUT_FROM = { off: 'Off', profit: 'Profit only', capital: 'Capital only', everything: 'Everything' };
+const blockCost = (th, price) => th * CONTRACT_DAYS * price;
+
+// Price of new hashrate in BTC per TH per day: what the user typed from the platform's reinvest page,
+// or the latest contract's price (allocated BTC ÷ TH/s ÷ 30) — whichever is newer.
+function blockPriceInfo(cycle) {
+  const last = data.purchases.filter(p => p.th > 0 && p.allocBtc > 0)
+    .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : a.num - b.num)).at(-1);
+  const fromContract = last && { price: last.allocBtc / last.th / CONTRACT_DAYS, date: last.date, src: `from contract #${last.num} on ${fmtDate(last.date)}` };
+  const typed = cycle?.blockPrice > 0 && { price: cycle.blockPrice, date: cycle.blockPriceDate || '', src: `entered by you${cycle.blockPriceDate ? ` on ${fmtDate(cycle.blockPriceDate)}` : ''}` };
+  const pick = typed && (!fromContract || typed.date >= fromContract.date) ? typed : fromContract;
+  if (!pick) return null;
+  const age = pick.date ? daysBetween(pick.date, todayIso()) : null;
+  return { ...pick, age, stale: age == null || age > 7 };
+}
+
+// Day-by-day model of the platform's loop. Each contract pays back 1/30 of its price plus profit every day for 30 days.
+// `reinvest` ('off' | 'capital' | 'profit' | 'both') is what goes back in: each day it buys as many whole blocks of
+// `block` BTC as it covers, and the rest waits for the next day. Everything else is paid out once it reaches `payoutAt`.
+// The balance at the start goes into one contract straight away, unless reinvesting is off.
+function simulate({ contracts, balance, rate, days, reinvest, block, payoutAt }) {
   const cs = contracts.map(c => ({ ...c })); // {btc, left}
-  let pot = stop ? 0 : balance; // waiting to be reinvested
-  let out = stop ? balance : 0; // waiting to be withdrawn
-  let withdrawn = 0;
-  const cap = [], wd = [], face = [];
+  let pot = 0, out = 0, withdrawn = 0, payouts = 0, buys = 0;
+  if (reinvest === 'off') out = balance;
+  else if (balance > 0) cs.push({ btc: balance, left: CONTRACT_DAYS });
+  const keepCapital = reinvest === 'capital' || reinvest === 'both';
+  const keepProfit = reinvest === 'profit' || reinvest === 'both';
+  const cap = [], wd = [], face = [], back = [0], wait = [];
   const step = () => {
-    if (!stop && pot > 0 && pot >= reinvestAt) { cs.push({ btc: pot, left: CONTRACT_DAYS }); pot = 0; }
-    if (out > 0 && out >= withdrawAt) { withdrawn += out; out = 0; }
+    const n = reinvest !== 'off' && block > 0 ? Math.floor(pot / block + 1e-9) : 0;
+    if (n > 0) { cs.push({ btc: n * block, left: CONTRACT_DAYS }); pot = Math.max(0, pot - n * block); buys++; }
+    if (out > 0 && out >= payoutAt) { withdrawn += out; out = 0; payouts++; }
     const working = sum(cs, c => (c.btc * c.left) / CONTRACT_DAYS);
-    cap.push(working + pot + out); wd.push(withdrawn); face.push(sum(cs, 'btc'));
+    cap.push(working + pot + out); wd.push(withdrawn); face.push(sum(cs, 'btc')); wait.push(pot);
   };
   step();
   for (let i = 1; i <= days; i++) {
+    let b = 0;
     for (const c of cs) {
-      const back = c.btc / CONTRACT_DAYS, profit = c.btc * rate;
-      if (stop) out += back + profit;
-      else { pot += back + profit * share; out += profit * (1 - share); }
+      const capBack = c.btc / CONTRACT_DAYS, profit = c.btc * rate;
+      b += capBack;
+      if (keepCapital) pot += capBack; else out += capBack;
+      if (keepProfit) pot += profit; else out += profit;
       c.left--;
     }
+    back.push(b);
     for (let j = cs.length - 1; j >= 0; j--) if (cs[j].left <= 0) cs.splice(j, 1);
     step();
   }
-  return { cap, wd, face };
+  return { cap, wd, face, back, wait, payouts, buys };
 }
 
 // ---------- rendering ----------
@@ -741,7 +768,7 @@ function renderOverview(R) {
   <h2>Right now</h2>
   <div class="grid">
     ${card('Capital working', m.working, { help: 'Price of all contracts active today.', sub: `${plural(m.activeCount, 'active contract')} · ${m.activeTh.toLocaleString('en-US')} TH/s` })}
-    ${card('Available balance (calculated)', m.balance, { help: 'Money in − paid for contracts + received − withdrawn. Returned capital and profit waiting for the reinvest/withdraw thresholds.', sub: cyc && (cyc.reinvestThreshold || cyc.withdrawThreshold) ? `Reinvest at ${fmtAmt(cyc.reinvestThreshold || NaN)} · withdraw at ${fmtAmt(cyc.withdrawThreshold || NaN)}` : '' })}
+    ${card('Available balance (calculated)', m.balance, { help: 'Money in − paid for contracts + received − withdrawn. Returned capital and profit waiting for the next reinvest block or payout.', sub: cyc?.reinvestFrom && cyc.reinvestFrom !== 'off' ? `Reinvests ${REINVEST_FROM[cyc.reinvestFrom].toLowerCase()} in ${(cyc.blockTh || MIN_BLOCK_TH).toLocaleString('en-US')} TH/s blocks${cyc.payoutFrom && cyc.payoutFrom !== 'off' ? ` · pays out ${PAYOUT_FROM[cyc.payoutFrom].toLowerCase()} at ${fmtAmt(cyc.withdrawThreshold || MIN_PAYOUT)}` : ''}` : '' })}
     ${lastCheck ? card('Balance check', checkDiff, { sign: true, tone: Math.abs(checkDiff) < 1e-6 ? 'pos' : 'warn', help: 'Your dashboard balance minus the calculated balance on that date. Small differences usually mean a payout that is not in the imported reports yet.', sub: `Dashboard ${fmtAmt(lastCheck.btc)} on ${fmtDate(lastCheck.date)}`, fiat: false }) : ''}
     ${card('Data up to', 0, { text: fmtDate(m.last), sub: plural(days.length, 'day') + ' of earnings' })}
   </div>
@@ -965,15 +992,19 @@ function missingDataHints(R) {
   return out;
 }
 
-// Inputs for the projection: the user's own numbers, or the current figures of this view.
+// Inputs for the projection: the user's own numbers, or the current figures and the cycle's platform settings.
 function projSetup(R) {
   const { m } = R;
   const capital = proj.capital ?? (m.onPlatform > 0 ? m.onPlatform : m.in);
   const per30 = proj.per30 ?? (isFinite(m.windows.d30.per30) ? m.windows.d30.per30 : m.windows.all.per30);
-  if (!(capital > 0) || !isFinite(per30)) return null;
   const cyc = R.cycle || cyclesSorted().at(-1);
-  const reinvestAt = proj.reinvestAt ?? cyc?.reinvestThreshold ?? 0;
-  const withdrawAt = proj.withdrawAt ?? cyc?.withdrawThreshold ?? 0;
+  const bp = blockPriceInfo(cyc);
+  const blockPrice = proj.blockPrice ?? bp?.price;
+  if (!(capital > 0) || !isFinite(per30) || !(blockPrice > 0)) return null;
+  const blockTh = proj.blockTh ?? cyc?.blockTh ?? MIN_BLOCK_TH;
+  const block = blockCost(blockTh, blockPrice);
+  const payoutAt = proj.payoutAt ?? cyc?.withdrawThreshold ?? MIN_PAYOUT;
+  const mine = cyc?.reinvestFrom || 'capital';
   const start = m.last || todayIso();
   // Start from the contracts still running and the balance; a different capital scales them.
   let contracts = R.P.filter(p => p.end > start).map(p => ({ btc: p.allocBtc, left: Math.min(CONTRACT_DAYS, daysBetween(start, p.end)) }));
@@ -981,13 +1012,16 @@ function projSetup(R) {
   let balance = capital - inContracts;
   if (balance < 0) { contracts = contracts.map(c => ({ ...c, btc: (c.btc * capital) / inContracts })); balance = 0; }
   const rate = per30 / CONTRACT_DAYS;
+  const run = (reinvest, b) => simulate({ contracts, balance, rate, days: proj.days, reinvest, block: b, payoutAt });
   const scenarios = [
-    { label: 'Stop reinvesting', note: 'capital and profit are withdrawn as they come back', share: null },
-    { label: 'Reinvest capital, withdraw profit', note: 'your plan', share: 0 },
-    ...(proj.custom > 0 && proj.custom < 100 ? [{ label: `Reinvest capital + ${proj.custom}% of profit`, note: '', share: proj.custom / 100 }] : []),
-    { label: 'Reinvest everything', note: 'withdraw nothing', share: 1 },
-  ].map(s => ({ ...s, p: simulate({ contracts, balance, rate, days: proj.days, share: s.share, reinvestAt, withdrawAt }) }));
-  return { capital, per30, rate, reinvestAt, withdrawAt, start, inContracts: Math.min(capital, inContracts), scenarios };
+    { key: 'off', label: 'Stop reinvesting', note: 'capital and profit are paid out as they come back' },
+    { key: 'capital', label: 'Reinvest capital only', note: 'profit is paid out' },
+    { key: 'profit', label: 'Reinvest profit only', note: 'capital is paid out' },
+    { key: 'both', label: 'Reinvest capital and profit', note: 'nothing is paid out' },
+  ].map(s => ({ ...s, mine: s.key === mine, p: run(s.key, block) }));
+  const sizes = [...new Set([100, 200, 300, 500, 1000, blockTh])].sort((a, b) => a - b);
+  const blocks = mine === 'off' ? [] : sizes.map(th => ({ th, cost: blockCost(th, blockPrice), p: run(mine, blockCost(th, blockPrice)) }));
+  return { capital, per30, rate, cyc, bp, blockTh, blockPrice, block, payoutAt, mine, start, inContracts: Math.min(capital, inContracts), scenarios, blocks };
 }
 
 function renderProjection(R) {
@@ -995,68 +1029,106 @@ function renderProjection(R) {
   const S = projSetup(R);
   if (!S) {
     const why = missingDataHints(R);
-    return `<div class="empty">Not enough data to project yet.<br><br>${why.length ? why.join('<br><br>') : 'Import some daily earnings and record your deposit first.'}</div>`;
+    return `<div class="empty">Not enough data to project yet.<br><br>${why.length ? why.join('<br><br>') : 'Import the daily earnings and hashrate purchases reports, and record your deposit first.'}</div>`;
   }
-  const { capital, per30, reinvestAt, withdrawAt, start } = S;
+  const { capital, per30, blockTh, blockPrice, block, payoutAt, start, bp, cyc } = S;
   const days = proj.days;
+  const months = days / CONTRACT_DAYS;
   const marks = [30, 90, 180, 365, 730].filter(d => d <= days);
   const u = unitLabel();
   const span = d => (d === 730 ? '2 years' : d === 365 ? '1 year' : d + ' days');
+  const total = (p, d = days) => p.wd[d] + p.cap[d];
+  const lastMonth = p => p.wd[days] - p.wd[Math.max(0, days - CONTRACT_DAYS)];
   const rows = S.scenarios.map(s => {
     const { cap, wd, face } = s.p;
     const be = m.remaining > 0 ? wd.findIndex(x => m.recovered + x >= m.in) : -1;
-    const lastMonth = wd[days] - wd[Math.max(0, days - CONTRACT_DAYS)];
     let fr = 0, n = 0;
     for (let i = 1; i <= days; i++) if (cap[i] > 1e-9) { fr += face[i] / cap[i]; n++; }
-    const leverage = s.share == null || !n ? NaN : fr / n;
-    return { ...s, be, lastMonth, leverage, at: d => ({ cap: cap[d], wd: wd[d] }) };
+    const leverage = s.key === 'off' || !n ? NaN : fr / n;
+    return { ...s, be, leverage, at: d => ({ cap: cap[d], wd: wd[d] }) };
   });
+  const mineRow = rows.find(r => r.mine);
+  const settingNote = cyc?.reinvestFrom ? 'your setting' : 'assumed: set yours in Settings';
+  // Biggest block the capital coming back can buy every day, with 5% headroom for loss days
+  const fitTh = btcPerDay => Math.floor((0.95 * btcPerDay) / (CONTRACT_DAYS * blockPrice));
+  const backNow = mineRow.p.back[1], backLater = mineRow.p.back[Math.min(days, CONTRACT_DAYS)];
+  const fitText = b => { const th = fitTh(b); return th >= MIN_BLOCK_TH ? `<b>${th.toLocaleString('en-US')} TH/s</b>` : `less than the ${MIN_BLOCK_TH} TH/s minimum, so blocks are bought every few days`; };
+  const base = S.blocks.find(b => b.th === MIN_BLOCK_TH);
+
   return `
   <h2>Projection</h2>
-  <p class="hint">Simulates your loop day by day. Each contract runs 30 days and pays back 1/30 of its price plus profit every day. What you reinvest buys a new contract once the balance reaches the reinvest threshold, so capital waiting for that is not earning. A contract keeps earning on its full price while its capital comes back, so reinvesting quickly lets the same BTC run up to about twice its value in contracts. Profit is withdrawn once it reaches the withdraw threshold. Returns are kept at a fixed rate: real returns change daily and loss days happen, so treat this as a guide, not a forecast. It also ignores the platform risk of keeping capital there.</p>
+  <p class="hint">A calculator, not a forecast: it plays your loop forward day by day as if your recent return stays the same. Each contract runs 30 days and pays back 1/30 of its price plus profit every day. What you reinvest buys whole blocks of hashrate, like the platform's auto-reinvest; what doesn't cover a whole block waits in your balance, earning nothing, until the next day. Everything else is paid out once it reaches your payout amount. Real returns change daily and loss days happen, and it ignores the risk of keeping BTC on the platform.</p>
   <form class="inline" data-form="projection">
-    <label>Capital in the loop (BTC)<input type="number" name="capital" step="0.00000001" min="0" value="${(+capital).toFixed(8)}" style="width:150px"></label>
-    <label>Return per 30 days (%)<input type="number" name="per30" step="0.01" value="${(per30 * 100).toFixed(2)}" style="width:110px"></label>
-    <label>Reinvest when balance reaches (BTC)<input type="number" name="reinvestAt" step="0.00000001" min="0" value="${(+reinvestAt).toFixed(8)}" style="width:150px"></label>
-    <label>Withdraw when profit reaches (BTC)<input type="number" name="withdrawAt" step="0.00000001" min="0" value="${(+withdrawAt).toFixed(8)}" style="width:150px"></label>
-    <label>Custom share of profit reinvested (%)<input type="number" name="custom" min="0" max="100" step="5" value="${proj.custom}" style="width:110px"></label>
+    <label>Capital (BTC)<input type="number" name="capital" step="0.00000001" min="0" value="${(+capital).toFixed(8)}" style="width:140px"></label>
+    <label>Return per 30 days (%)<input type="number" name="per30" step="0.01" value="${(per30 * 100).toFixed(2)}" style="width:100px"></label>
+    <label>Block size (TH/s)<input type="number" name="blockTh" step="1" min="${MIN_BLOCK_TH}" value="${blockTh}" style="width:100px"></label>
+    <label>Block price (BTC per TH per day)<input type="number" name="blockPrice" step="0.000000000001" min="0" value="${blockPrice.toFixed(12)}" style="width:170px"></label>
+    <label>Pay out when it reaches (BTC)<input type="number" name="payoutAt" step="0.00000001" min="0" value="${(+payoutAt).toFixed(8)}" style="width:130px"></label>
     <label>Look ahead<select name="days">${[90, 180, 365, 730].map(d => `<option value="${d}" ${d === days ? 'selected' : ''}>${span(d)}</option>`).join('')}</select></label>
     <button class="primary">Update</button>
     <button type="button" data-act="proj-reset">Use my current figures</button>
   </form>
-  <p class="hint">Starting point on ${fmtDate(start)}: ${fmtAmtU(capital)} in the loop (${fmtAmt(S.inContracts)} still in running contracts, the rest in your balance), at ${fmtPct(per30, 2)} per 30 days${proj.per30 == null ? (isFinite(m.windows.d30.per30) ? ' (your last 30 days)' : ' (your whole cycle so far)') : ''}. A threshold of 0 means every day. Money in: ${fmtAmtU(m.in)}, already back: ${fmtAmtU(m.recovered)}.</p>
+  <p class="hint">Starting on ${fmtDate(start)} with ${fmtAmtU(capital)}${S.inContracts > 0 ? ` (${fmtAmt(S.inContracts)} still in running contracts; the rest goes into one new contract)` : ' in one new contract'}, at ${fmtPct(per30, 2)} per 30 days${proj.per30 == null ? (isFinite(m.windows.d30.per30) ? ' (your last 30 days)' : ' (your whole cycle so far)') : ''}.
+    One block of ${blockTh.toLocaleString('en-US')} TH/s costs <b>${fmtAmtU(block)}</b>${fiat(block) ? ` (${fiat(block)})` : ''}.
+    Block price ${proj.blockPrice != null ? 'typed here' : bp ? `<span class="${bp.stale ? 'warn' : ''}">${esc(bp.src)}${bp.stale ? ` — ${bp.age != null ? plural(bp.age, 'day') + ' old; ' : ''}check the platform's reinvest page for today's price` : ''}</span>` : ''}.
+    ${payoutAt < MIN_PAYOUT ? `<span class="warn">The platform's smallest payout is ${MIN_PAYOUT} BTC.</span>` : ''}
+    Money in: ${fmtAmtU(m.in)}, already back: ${fmtAmtU(m.recovered)}.</p>
 
   <h2>Each scenario at a glance</h2>
+  <p class="hint">The four ways the platform's auto-reinvest can be set. Profit and capital that aren't reinvested are paid out.</p>
   <div class="table-wrap"><table>
-    <thead><tr><th>Scenario</th>
+    <thead><tr><th>Reinvest from</th>
       <th class="n">Paid to your wallet per month ${help(`What reaches your wallet in the last 30 days of the ${span(days)} projection.`)}</th>
-      <th class="n">Your total after ${span(days)} ${help('Everything withdrawn to your wallet by then, plus what is still on the platform.')}</th>
-      <th class="n">Contracts running ${help('Average total price of the running contracts compared with the capital in the loop. A contract earns on its full price for 30 days while its capital comes back daily, so reinvesting that capital quickly lets the same BTC run up to about 2× its value in contracts. A high reinvest threshold leaves capital waiting and lowers this.')}</th>
+      <th class="n">Payouts ${help(`How often the amount waiting to be paid out reaches ${fmtAmtU(payoutAt)}, and the average payout.`)}</th>
+      <th class="n">Your total after ${span(days)} ${help('Everything paid to your wallet by then, plus what is still on the platform.')}</th>
+      <th class="n">Contracts running ${help('Average total price of the running contracts compared with the capital in the loop. A contract earns on its full price for 30 days while its capital comes back daily, so reinvesting that capital lets the same BTC run up to about 2× its value in contracts. BTC waiting for a whole block lowers this.')}</th>
       <th class="n">All money in back in your wallet by</th></tr></thead>
     <tbody>${rows.map(r => `<tr>
-      <td><b>${esc(r.label)}</b>${r.note ? `<br><small class="hint">${esc(r.note)}</small>` : ''}</td>
-      <td class="n">${fmtAmtU(r.lastMonth)}<br><small class="usd">${fiat(r.lastMonth)}</small></td>
-      <td class="n">${fmtAmtU(r.at(days).wd + r.at(days).cap)}<br><small class="usd">${fiat(r.at(days).wd + r.at(days).cap)}</small></td>
+      <td><b>${esc(r.label)}</b>${r.mine ? ` <span class="pill">${settingNote}</span>` : ''}<br><small class="hint">${esc(r.note)}</small></td>
+      <td class="n">${fmtAmtU(lastMonth(r.p))}<br><small class="usd">${fiat(lastMonth(r.p))}</small></td>
+      <td class="n">${r.p.payouts ? `${(r.p.payouts / months).toFixed(1)} a month<br><small class="usd">~${fmtAmtU(r.p.wd[days] / r.p.payouts)} each</small>` : '—'}</td>
+      <td class="n">${fmtAmtU(total(r.p))}<br><small class="usd">${fiat(total(r.p))}</small></td>
       <td class="n">${isFinite(r.leverage) ? r.leverage.toFixed(2) + '× capital' : '—'}</td>
       <td class="n">${m.remaining <= 0 ? 'already back' : r.be >= 0 ? `${fmtDate(addDays(start, r.be))}<br><small class="usd">in ${plural(r.be, 'day')}</small>` : `not within ${span(days)}`}</td>
     </tr>`).join('')}</tbody>
   </table></div>
 
+  ${S.blocks.length ? `<h2>Choosing a block size</h2>
+  <p class="hint">For <b>${esc(mineRow.label.toLowerCase())}</b>. Bigger blocks mean fewer, larger contracts, but the BTC coming back waits in your balance until it covers a whole block, and waiting BTC earns nothing.
+    Capital coming back each day: ${fmtAmtU(backNow)} at the start → about ${fmtAmtU(backLater)} after a month, as the blocks you buy start paying back too.
+    The biggest block that fills every day (keeping 5% spare for loss days): ${fitText(backNow)} at the start, ${fitText(backLater)} after a month.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Block size</th><th class="n">One block costs</th><th class="n">Purchases per month</th><th class="n">BTC waiting on average</th><th class="n">Paid to your wallet per month ${help(`Average over the ${span(days)}.`)}</th><th class="n">Your total after ${span(days)}</th><th class="n">Profit compared with ${MIN_BLOCK_TH} TH/s ${help(`Profit = your total after ${span(days)} minus the capital you start with. This shows how much of it waiting for bigger blocks costs you.`)}</th></tr></thead>
+    <tbody>${S.blocks.map(b => {
+      const avgWait = sum(b.p.wait, x => x) / b.p.wait.length;
+      const gain = p => total(p) - capital;
+      const diff = base && gain(base.p) > 0 ? gain(b.p) / gain(base.p) - 1 : NaN;
+      return `<tr class="${b.th === blockTh ? 'current' : ''}">
+        <td><b>${b.th.toLocaleString('en-US')} TH/s</b>${b.th === blockTh ? ` <span class="pill">${proj.blockTh != null ? 'typed above' : cyc?.blockTh ? 'your setting' : 'minimum'}</span>` : ''}</td>
+        <td class="n">${fmtAmt(b.cost)}<br><small class="usd">${fiat(b.cost)}</small></td>
+        <td class="n">${(b.p.buys / months).toFixed(1)}</td>
+        <td class="n">${fmtAmt(avgWait)}</td>
+        <td class="n">${fmtAmt(b.p.wd[days] / months)}</td>
+        <td class="n">${fmtAmt(total(b.p))}</td>
+        <td class="n ${tone(diff)}">${Math.abs(diff) < 0.0005 ? '—' : fmtPct(diff, 1, true)}</td></tr>`;
+    }).join('')}</tbody>
+  </table></div>` : ''}
+
   <h2>Over time</h2>
-  <p class="hint"><b>To your wallet</b>: everything withdrawn from today up to that point, added up. <b>On the platform</b>: your BTC still there at that point, in contracts or waiting in your balance. Together they are your total.</p>
+  <p class="hint"><b>To your wallet</b>: everything paid out from today up to that point, added up. <b>On the platform</b>: your BTC still there at that point, in contracts or waiting in your balance. Together they are your total.</p>
   <div class="table-wrap"><table class="grouped">
     <thead>
-      <tr><th rowspan="2">Scenario</th>${marks.map(d => `<th colspan="2" class="grp">After ${span(d)} (${u})<br><small>${fmtDate(addDays(start, d))}</small></th>`).join('')}</tr>
+      <tr><th rowspan="2">Reinvest from</th>${marks.map(d => `<th colspan="2" class="grp">After ${span(d)} (${u})<br><small>${fmtDate(addDays(start, d))}</small></th>`).join('')}</tr>
       <tr>${marks.map(() => '<th class="n grp-start">To your wallet</th><th class="n">On the platform</th>').join('')}</tr>
     </thead>
     <tbody>${rows.map(r => `<tr>
-      <td><b>${esc(r.label)}</b></td>
+      <td><b>${esc(r.label)}</b>${r.mine ? ` <span class="pill">${settingNote}</span>` : ''}</td>
       ${marks.map(d => `<td class="n grp-start">${fmtAmt(r.at(d).wd)}</td><td class="n platform">${fmtAmt(r.at(d).cap)}</td>`).join('')}
     </tr>`).join('')}</tbody>
   </table></div>
 
   <div class="charts" style="margin-top:12px">
-    <div class="chart-box"><h3>Total withdrawn to your wallet (${u})</h3><div class="canvas"><canvas id="chProjW"></canvas></div></div>
+    <div class="chart-box"><h3>Total paid to your wallet (${u})</h3><div class="canvas"><canvas id="chProjW"></canvas></div></div>
     <div class="chart-box"><h3>On the platform (${u})</h3><div class="canvas"><canvas id="chProjC"></canvas></div></div>
   </div>`;
 }
@@ -1068,27 +1140,27 @@ function drawProjection(R) {
   if (!S) return;
   const { v, base, yAxis } = chartTheme();
   const k = unitScale();
-  const colors = [v('--muted'), v('--chart-1'), v('--chart-2'), v('--chart-3')];
+  const colors = [v('--muted'), v('--chart-1'), v('--chart-3'), v('--chart-2')];
   const step = proj.days > 365 ? 7 : proj.days > 180 ? 3 : 1;
   const idx = [];
   for (let i = 0; i <= proj.days; i += step) idx.push(i);
   const labels = idx.map(i => dayLabel(addDays(S.start, i)));
   const sets = S.scenarios.map((s, i) => ({ ...s, color: colors[i % colors.length] }));
-  const lineOpts = { pointRadius: 0, borderWidth: 2 };
+  const line = x => ({ label: x.label, borderColor: x.color, pointRadius: 0, borderWidth: x.mine ? 3 : 2 });
   charts.projW = new Chart($('#chProjW'), {
     type: 'line',
     data: {
       labels,
       datasets: [
-        ...sets.filter(x => x.share !== 1).map(x => ({ label: x.label, data: idx.map(i => x.p.wd[i] * k), borderColor: x.color, ...lineOpts })),
-        ...(m.remaining > 0 ? [{ label: 'Money in still to recover', data: idx.map(() => m.remaining * k), borderColor: v('--neg'), borderDash: [6, 4], ...lineOpts, borderWidth: 1.5 }] : []),
+        ...sets.filter(x => x.key !== 'both').map(x => ({ ...line(x), data: idx.map(i => x.p.wd[i] * k) })),
+        ...(m.remaining > 0 ? [{ label: 'Money in still to recover', data: idx.map(() => m.remaining * k), borderColor: v('--neg'), borderDash: [6, 4], pointRadius: 0, borderWidth: 1.5 }] : []),
       ],
     },
     options: { ...base, scales: { ...base.scales, y: yAxis({ beginAtZero: true }) } },
   });
   charts.projC = new Chart($('#chProjC'), {
     type: 'line',
-    data: { labels, datasets: sets.map(x => ({ label: x.label, data: idx.map(i => x.p.cap[i] * k), borderColor: x.color, ...lineOpts })) },
+    data: { labels, datasets: sets.map(x => ({ ...line(x), data: idx.map(i => x.p.cap[i] * k) })) },
     options: { ...base, scales: { ...base.scales, y: yAxis({ beginAtZero: true }) } },
   });
 }
@@ -1250,6 +1322,32 @@ function hiddenBeforeFirstCycle() {
   return `${parts.join(', ')} ${days + contracts + payouts === 1 ? 'is' : 'are'} dated before your first cycle, <b>${esc(first.name)}</b>, starts (${fmtDate(first.start)}), so no cycle view shows them. Change its start date on the <b>Settings</b> tab, or switch <b>View</b> to "All time".`;
 }
 
+// A cycle's auto-reinvest and payout, as set on the platform. The app only uses them for its calculations.
+function platformPanel(c) {
+  const bp = blockPriceInfo(c);
+  const th = c.blockTh || MIN_BLOCK_TH;
+  const cost = bp ? blockCost(th, bp.price) : NaN;
+  const opts = (map, v) => Object.entries(map).map(([k, l]) => `<option value="${k}" ${k === (v || 'off') ? 'selected' : ''}>${l}</option>`).join('');
+  const notes = [];
+  if (c.withdrawThreshold != null && c.withdrawThreshold < MIN_PAYOUT) notes.push(`The platform's smallest payout is ${MIN_PAYOUT} BTC.`);
+  const r = c.reinvestFrom, p = c.payoutFrom;
+  const overlap = (r === 'both' && p && p !== 'off') || (r === 'capital' && (p === 'capital' || p === 'everything')) || (r === 'profit' && (p === 'profit' || p === 'everything'));
+  if (overlap) notes.push('Reinvest and payout both use the same money; check which one the platform applies first.');
+  return `<form class="panel" data-form="cycle-settings" data-cycle="${c.id}" style="margin-top:10px">
+    <div style="margin-bottom:8px"><b>${esc(c.name)}</b>: auto-reinvest and payout ${help('Copy what you set on the platform. The app uses these for its calculations and the Projection tab; it never changes anything on the platform.')}</div>
+    <div class="inline">
+      <label>Reinvest from<select name="reinvestFrom">${opts(REINVEST_FROM, c.reinvestFrom)}</select></label>
+      <label>Block size (TH/s)<input type="number" name="blockTh" min="${MIN_BLOCK_TH}" step="1" value="${c.blockTh ?? ''}" placeholder="${MIN_BLOCK_TH}" style="width:100px"></label>
+      <label>Block price (BTC per TH per day)<input type="number" name="blockPrice" min="0" step="0.000000000001" value="${c.blockPrice > 0 ? c.blockPrice.toFixed(12) : ''}" placeholder="${bp && !(c.blockPrice > 0) ? bp.price.toFixed(12) : 'from your latest contract'}" style="width:180px"></label>
+      <label>Pay out<select name="payoutFrom">${opts(PAYOUT_FROM, c.payoutFrom)}</select></label>
+      <label>Pay out when it reaches (BTC)<input type="number" name="withdrawThreshold" min="0" step="0.00000001" value="${c.withdrawThreshold ?? ''}" placeholder="${MIN_PAYOUT}" style="width:120px"></label>
+    </div>
+    <div class="hint" style="margin:8px 0 0">${bp ? `One block of ${th.toLocaleString('en-US')} TH/s costs <b>${fmtAmtU(cost)}</b>${fiat(cost) ? ` (${fiat(cost)})` : ''} at ${bp.price.toFixed(12)} BTC per TH per day, <span class="${bp.stale ? 'warn' : ''}">${esc(bp.src)}${bp.stale && bp.age != null ? ` (${plural(bp.age, 'day')} old)` : ''}</span>.` : 'Import the hashrate purchases report, or type the block price from the platform.'}
+      Leave the block price empty to use your latest contract's price; type the rate from the platform's reinvest page when it's newer.</div>
+    ${notes.map(n => `<div class="hint warn" style="margin:4px 0 0">⚠ ${n}</div>`).join('')}
+  </form>`;
+}
+
 function renderSettings() {
   const cs = cyclesSorted();
   const counts = `${plural(data.purchases.length, 'contract')} · ${plural(new Set(data.earnings.map(e => e.date)).size, 'day')} of earnings · ${plural(data.payouts.length, 'payout')} · ${data.summaries.length} contract results`;
@@ -1259,7 +1357,6 @@ function renderSettings() {
   const leftover = lastCycle ? compute(lastCycle.id).m.balance : 0;
   const lastEarn = [...data.earnings].sort(byDate).at(-1)?.date;
   const when = iso => (iso ? new Date(iso).toLocaleString('en-GB', { dateStyle: 'medium', timeStyle: 'short' }) : '—');
-  const thresholdHelp = 'For your own records and the Projection tab. Set the same values in the platform\'s auto-reinvest and auto-withdraw settings; the app does not change anything on the platform.';
   const contentsText = c => {
     const n = cycleContents(c.id);
     const parts = [n.contracts && plural(n.contracts, 'contract'), n.days && plural(n.days, 'day') + ' of earnings', n.payouts && plural(n.payouts, 'payout'), n.deposits && plural(n.deposits, 'deposit')].filter(Boolean);
@@ -1267,19 +1364,18 @@ function renderSettings() {
   };
   return `<div class="cols"><div>
   <h2>Cycles</h2>
-  <p class="hint">A cycle is one run of the loop, starting from a fresh contract. Everything dated on or after a cycle's start date (and before the next cycle's start) belongs to it. Thresholds are in BTC. Changes here are saved straight away.</p>
+  <p class="hint">A cycle is one run of the loop, starting from a fresh contract. Everything dated on or after a cycle's start date (and before the next cycle's start) belongs to it. Changes here are saved straight away.</p>
   ${hidden ? `<div class="alert warn" style="margin-bottom:10px">⚠ <span>${hidden}</span></div>` : ''}
   ${cs.length ? `<div class="table-wrap"><table>
-    <thead><tr><th>Name</th><th>Start</th><th>Contains</th><th class="n">Reinvest at ${help(thresholdHelp)}</th><th class="n">Withdraw at ${help(thresholdHelp)}</th><th>Notes</th><th></th></tr></thead>
+    <thead><tr><th>Name</th><th>Start</th><th>Contains</th><th>Notes</th><th></th></tr></thead>
     <tbody>${cs.map(c => `<tr data-cycle="${c.id}">
       <td><input name="name" value="${esc(c.name)}" style="width:110px"></td>
       <td><input type="date" name="start" value="${c.start}"></td>
       <td class="note" style="min-width:150px;max-width:190px">${contentsText(c)}</td>
-      <td class="n"><input type="number" step="0.00000001" min="0" name="reinvestThreshold" value="${c.reinvestThreshold ?? ''}" style="width:100px">${c.reinvestThreshold ? `<br><small class="usd">${fiat(c.reinvestThreshold)}</small>` : ''}</td>
-      <td class="n"><input type="number" step="0.00000001" min="0" name="withdrawThreshold" value="${c.withdrawThreshold ?? ''}" style="width:100px">${c.withdrawThreshold ? `<br><small class="usd">${fiat(c.withdrawThreshold)}</small>` : ''}</td>
-      <td><input name="notes" value="${esc(c.notes)}" style="width:100%;min-width:120px"></td>
+      <td><input name="notes" value="${esc(c.notes)}" style="width:100%;min-width:200px"></td>
       <td class="actions"><button class="danger" data-act="del-cycle" data-id="${c.id}">Delete</button></td></tr>`).join('')}</tbody>
   </table></div>` : ''}
+  ${cs.slice().reverse().map(platformPanel).join('')}
 
   <h2>Start a new cycle</h2>
   <p class="hint">Set the start date to the day of the first new contract. If the previous cycle's contracts are still paying out, wait until they've ended so their last payouts stay in that cycle.${leftover > 0 ? ` "Carried over" is filled in with ${esc(lastCycle.name)}'s calculated balance; check it against your dashboard.` : ''}</p>
@@ -1289,11 +1385,9 @@ function renderSettings() {
     <label>Carried over BTC<input type="number" name="carry" step="0.00000001" min="0" style="width:140px" placeholder="0" value="${leftover > 0 ? leftover.toFixed(8) : ''}"></label>
     <label>New BTC sent in<input type="number" name="fresh" step="0.00000001" min="0" style="width:140px" placeholder="0"></label>
     <label>USD/USDT paid for it (optional)<input type="number" name="freshUsd" step="0.01" min="0" style="width:130px"></label>
-    <label>Reinvest at (BTC)<input type="number" name="reinvestThreshold" step="0.00000001" min="0" style="width:120px"></label>
-    <label>Withdraw at (BTC)<input type="number" name="withdrawThreshold" step="0.00000001" min="0" style="width:120px"></label>
     <button class="primary">Create cycle</button>
   </form>
-  <p class="hint" style="margin-top:8px">Reinvest at / Withdraw at: ${thresholdHelp}${usdPrice() ? ` For scale, 0.001 BTC ≈ ${fiat(0.001)}.` : ''}</p>
+  <p class="hint" style="margin-top:8px">Once it's created, fill in its auto-reinvest and payout settings above.</p>
 
   <h2>Display</h2>
   <div class="panel prefs">
@@ -1615,7 +1709,7 @@ function bind() {
     const t = e.target.closest('button[data-tab]');
     if (t) { currentTab = t.dataset.tab; editing = null; render(); }
   });
-  $('#scope').addEventListener('change', e => { currentScope = e.target.value; proj.capital = proj.per30 = proj.reinvestAt = proj.withdrawAt = null; render(); });
+  $('#scope').addEventListener('change', e => { currentScope = e.target.value; resetProj(); render(); });
   $('#importBtn').addEventListener('click', () => $('#importInput').click());
   $('#importInput').addEventListener('change', e => { importFiles([...e.target.files]); e.target.value = ''; });
 
@@ -1656,7 +1750,7 @@ function bind() {
     else if (act === 'import-backup') $('#backupInput').click();
     else if (act === 'dismiss-import') { data.lastImport = null; save(); render(); }
     else if (act === 'toggle-month') { const ym = b.dataset.ym; collapsedMonths.has(ym) ? collapsedMonths.delete(ym) : collapsedMonths.add(ym); render(); }
-    else if (act === 'proj-reset') { proj.capital = proj.per30 = proj.reinvestAt = proj.withdrawAt = null; render(); }
+    else if (act === 'proj-reset') { resetProj(); render(); }
     else if (act === 'edit') { editing = { type: b.dataset.type, id }; render(); }
     else if (act === 'cancel-edit') { editing = null; render(); }
     else if (act === 'save-edit') {
@@ -1695,12 +1789,15 @@ function bind() {
       return;
     }
     if (e.target.dataset.act === 'group-daily') { groupDaily = e.target.checked; render(); return; }
-    const row = e.target.closest('tr[data-cycle]');
+    const row = e.target.closest('[data-cycle]');
     if (row) {
       const c = data.cycles.find(x => x.id === row.dataset.cycle);
       const f = e.target.name;
       if (f === 'start' && !isIso(e.target.value)) return;
-      c[f] = /Threshold$/.test(f) ? (e.target.value === '' ? null : num(e.target.value)) : e.target.value;
+      const isNum = /Threshold$|^block(Th|Price)$/.test(f);
+      c[f] = isNum ? (e.target.value === '' || !(num(e.target.value) >= 0) ? null : num(e.target.value)) : e.target.value;
+      if (f === 'blockTh' && c.blockTh != null && c.blockTh < MIN_BLOCK_TH) { c.blockTh = MIN_BLOCK_TH; toast(`The platform's smallest block is ${MIN_BLOCK_TH} TH/s.`, true); }
+      if (f === 'blockPrice') c.blockPriceDate = c.blockPrice > 0 ? todayIso() : null;
       save(); render(); toast(`${c.name}: saved`);
     }
   });
@@ -1715,13 +1812,14 @@ function bind() {
       const changed = n => form.elements[n].value !== form.elements[n].defaultValue;
       if (changed('capital')) proj.capital = num(f.capital) > 0 ? num(f.capital) : null;
       if (changed('per30')) proj.per30 = isFinite(num(f.per30)) ? num(f.per30) / 100 : null;
-      if (changed('reinvestAt')) proj.reinvestAt = f.reinvestAt === '' ? null : Math.max(0, num(f.reinvestAt) || 0);
-      if (changed('withdrawAt')) proj.withdrawAt = f.withdrawAt === '' ? null : Math.max(0, num(f.withdrawAt) || 0);
+      if (changed('blockTh')) proj.blockTh = num(f.blockTh) > 0 ? Math.max(MIN_BLOCK_TH, Math.round(num(f.blockTh))) : null;
+      if (changed('blockPrice')) proj.blockPrice = num(f.blockPrice) > 0 ? num(f.blockPrice) : null;
+      if (changed('payoutAt')) proj.payoutAt = f.payoutAt === '' ? null : Math.max(0, num(f.payoutAt) || 0);
       proj.days = parseInt(f.days, 10) || 365;
-      proj.custom = Math.min(100, Math.max(0, num(f.custom) || 0));
       render();
       return;
     }
+    if (form.dataset.form === 'cycle-settings') return; // fields save as they change
     if (form.dataset.form === 'deposit') {
       data.deposits.push({ id: uid(), cycleId: f.cycleId, date: f.date, btc: num(f.btc), usd: num(f.usd) > 0 ? num(f.usd) : null, kind: f.kind, note: f.note.trim() });
     } else if (form.dataset.form === 'deposit-orders') {
@@ -1738,7 +1836,7 @@ function bind() {
     } else if (form.dataset.form === 'cycle') {
       if (data.cycles.some(c => c.start === f.start)) { toast('A cycle already starts on that date.', true); return; }
       const id = uid();
-      data.cycles.push({ id, name: f.name.trim(), start: f.start, reinvestThreshold: f.reinvestThreshold ? num(f.reinvestThreshold) : null, withdrawThreshold: f.withdrawThreshold ? num(f.withdrawThreshold) : null, notes: '' });
+      data.cycles.push({ id, name: f.name.trim(), start: f.start, withdrawThreshold: null, notes: '' });
       if (num(f.carry) > 0) data.deposits.push({ id: uid(), cycleId: id, date: f.start, btc: num(f.carry), kind: 'carry', note: 'Balance carried over' });
       if (num(f.fresh) > 0) data.deposits.push({ id: uid(), cycleId: id, date: f.start, btc: num(f.fresh), usd: num(f.freshUsd) > 0 ? num(f.freshUsd) : null, kind: 'new', note: 'New BTC sent in' });
       currentScope = id;

@@ -192,8 +192,8 @@ tr.lossrow td { background: color-mix(in srgb, var(--neg) 7%, transparent); }
 .chart-box .canvas { position: relative; height: 260px; }
 @media (min-width: 1400px) and (min-height: 1000px) { .chart-box .canvas { height: 300px; } }
 
-form.inline { display: flex; gap: 8px; flex-wrap: wrap; align-items: end; margin-bottom: 12px; }
-form.inline label { display: flex; flex-direction: column; gap: 3px; font-size: 12.5px; color: var(--muted); }
+form.inline, div.inline { display: flex; gap: 8px; flex-wrap: wrap; align-items: end; margin-bottom: 12px; }
+form.inline label, div.inline label { display: flex; flex-direction: column; gap: 3px; font-size: 12.5px; color: var(--muted); }
 .empty { color: var(--muted); padding: 24px; text-align: center; background: var(--panel); border: 1px dashed var(--border); border-radius: 10px; }
 
 .dropzone {
@@ -219,3 +219,5 @@ table.grouped th { position: static; }
 th.grp { text-align: center; border-left: 1px solid var(--border); }
 th.grp-start, td.grp-start { border-left: 1px solid var(--border); }
 td.platform { color: var(--muted); }
+.pill { display: inline-block; font-size: 11px; font-weight: 600; padding: 1px 7px; border-radius: 999px; background: var(--panel-2); border: 1px solid var(--border); color: var(--muted); vertical-align: 1px; }
+tr.current td { background: var(--panel-2); }
