@@ -23,11 +23,12 @@ Re-import whenever you like. Rows are refreshed, never doubled, and reinvestment
 
 ## What it shows
 
-- Money in, withdrawn, still on the platform, and the net result
+- Money in, withdrawn, still on the platform, and the net result, in BTC and in USD/AED (valued on the day the money moved)
 - Return per day, per 30 days and per year in BTC, for the last 7 days, last 30 days and the whole cycle
 - Profit split into bonus and mining, and loss days
-- Monthly summary, daily history, and each contract's price and margin
-- Projections with different reinvestment shares
+- Monthly summary, daily history, and each contract's price, USD cost and margin
+- Projections that simulate the contract loop day by day: stop reinvesting, reinvest capital, or reinvest some or all of the profit, with your reinvest and withdraw thresholds
+- Deposits paid in USDT, taken straight from your purchase orders
 - Warnings for missing reports, stale data, loss streaks and bonus changes
 - Amounts in BTC or sats, with USD or AED alongside
 

@@ -213,3 +213,9 @@ form.inline label { display: flex; flex-direction: column; gap: 3px; font-size: 
   .banner { margin-left: 16px; margin-right: 16px; }
   .charts { grid-template-columns: 1fr; }
 }
+
+/* projection: two-level headers */
+table.grouped th { position: static; }
+th.grp { text-align: center; border-left: 1px solid var(--border); }
+th.grp-start, td.grp-start { border-left: 1px solid var(--border); }
+td.platform { color: var(--muted); }
