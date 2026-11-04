@@ -25,7 +25,7 @@ Re-import whenever you like. Rows are refreshed, never doubled, and reinvestment
 
 - Money in, withdrawn, still on the platform, and the net result
 - Return per day, per 30 days and per year in BTC, for the last 7 days, last 30 days and the whole cycle
-- Profit split into bonus and mining, loss days, and entry-cost gaps
+- Profit split into bonus and mining, and loss days
 - Monthly summary, daily history, and each contract's price and margin
 - Projections with different reinvestment shares
 - Warnings for missing reports, stale data, loss streaks and bonus changes

@@ -4,7 +4,7 @@
 // Data lives in a folder the user picks (File System Access API, Chrome): cloud-mining.json
 // plus daily backups. It is mirrored to localStorage so nothing is lost while disconnected.
 
-const APP_VERSION = '1.2.0';
+const APP_VERSION = '1.3.0';
 const DATA_VERSION = 2;
 const STORAGE_KEY = 'cloud-mining-data';
 const PREFS_KEY = 'cloud-mining-prefs';
@@ -331,9 +331,10 @@ function compute(scope) {
   const m = {};
   m.in = sum(D, 'btc');
   m.carriedOut = sum(carryOut, 'btc');
-  m.paid = sum(P, 'paidBtc');
-  m.alloc = sum(P, 'allocBtc');
-  m.gap = m.paid - m.alloc;
+  // A contract's real cost is its allocated BTC. The report's "purchased" BTC on USDT-paid orders is
+  // the USD converted at one report-wide rate, not what left the balance (checked against the dashboard).
+  m.paid = sum(P, 'allocBtc');
+  m.alloc = m.paid;
   m.received = sum(days, 'total');
   m.capBack = sum(days, 'cost');
   m.profit = sum(days, 'profit');
@@ -390,7 +391,7 @@ function balanceAt(scope, date) {
   const deps = (scope === 'all' ? data.deposits.filter(d => d.kind !== 'carry') : data.deposits.filter(d => d.cycleId === scope)).filter(d => le(d.date));
   const nc = scope === 'all' ? null : nextCycle(scope);
   const carry = nc ? data.deposits.filter(d => d.cycleId === nc.id && d.kind === 'carry' && le(d.date)) : [];
-  const paid = sum(data.purchases.filter(p => inS(p.date) && le(p.date)), 'paidBtc');
+  const paid = sum(data.purchases.filter(p => inS(p.date) && le(p.date)), 'allocBtc');
   const recv = sum(data.earnings.filter(r => inS(r.date) && le(r.date)), 'totalBtc');
   const out = sum(data.payouts.filter(p => inS(p.requested) && le(p.requested) && !isFailed(p.status)), 'btc');
   return sum(deps, 'btc') - paid + recv - out - sum(carry, 'btc');
@@ -403,7 +404,6 @@ function contractRows(P) {
     const daysLeft = daysBetween(today, p.end);
     return {
       ...p, s,
-      gap: p.paidBtc - p.allocBtc,
       satsPerTh: (p.allocBtc / p.th) * 1e8,
       state: today < p.start ? 'not started' : today > p.end ? 'ended' : `active · ${daysLeft + 1}d left`,
       active: today >= p.start && today <= p.end,
@@ -424,7 +424,7 @@ function monthRows(R) {
     if (d.profit < 0) r.lossDays++;
   }
   for (const w of R.W) get(w.requested.slice(0, 7)).withdrawn += w.btc;
-  for (const p of R.P) { const r = get(p.date.slice(0, 7)); r.bought++; r.boughtBtc += p.paidBtc; }
+  for (const p of R.P) { const r = get(p.date.slice(0, 7)); r.bought++; r.boughtBtc += p.allocBtc; }
   return [...months.values()].sort((a, b) => (a.ym < b.ym ? -1 : 1)).map(r => ({ ...r, per30: r.cost > 0 ? r.profit / r.cost : NaN }));
 }
 
@@ -478,9 +478,6 @@ function warnings(R) {
 
   for (const p of R.W.filter(p => !isDone(p.status))) add('info', `Payout of ${fmtAmtU(p.btc)} requested on ${fmtDate(p.requested)} is still "${esc(p.status)}".`);
 
-  for (const p of R.P.filter(p => daysBetween(p.date, today) <= 30 && p.paidBtc - p.allocBtc > 1e-7)) {
-    add('info', `Contract #${p.num} (${fmtDate(p.date)}) had an entry gap of ${fmtAmtU(p.allocBtc - p.paidBtc, true)} (${fmtPct((p.paidBtc - p.allocBtc) / p.paidBtc, 1)}).`);
-  }
   return out;
 }
 
@@ -684,7 +681,7 @@ function renderOverview(R) {
     ${card('Money in', m.in, { help: 'BTC you sent to the platform for this cycle (including any balance carried over from the previous cycle).', sub: m.in ? '' : '<span class="warn">No deposit recorded — add it on the Money in &amp; out tab.</span>' })}
     ${card('Withdrawn to your wallet', m.withdrawn, { help: 'Payouts sent to your own wallet.' + (m.carriedOut ? ' Carried over to the next cycle is shown below.' : ''), sub: m.carriedOut ? `+ ${fmtAmtU(m.carriedOut)} carried to next cycle` : plural(R.W.length, 'payout') })}
     ${card('Still on the platform', m.onPlatform, { help: 'Your BTC that is still exposed to the platform: the available balance plus capital inside contracts that has not come back yet.', sub: `${fmtAmt(m.balance)} balance · ${fmtAmt(m.outstanding)} in contracts` })}
-    ${card('Net result', m.net, { sign: true, tone: tone(m.net), help: 'Withdrawn + still on the platform − money in. This is your real profit or loss after entry costs and loss days.', sub: `${fmtPct(m.retOnIn, 2, true)} of money in` })}
+    ${card('Net result', m.net, { sign: true, tone: tone(m.net), help: 'Withdrawn + still on the platform − money in. This is your real profit or loss after loss days.', sub: `${fmtPct(m.retOnIn, 2, true)} of money in` })}
   </div>
 
   <div class="cols charts-right"><div class="left">
@@ -716,9 +713,7 @@ function renderOverview(R) {
     ${card('Total profit', m.profit, { sign: true, tone: tone(m.profit), help: 'Σ Profit from the daily report (Total − Cost). Includes loss days.', sub: `on ${fmtAmt(m.capBack)} capital returned` })}
     ${card('From the bonus', m.bonus, { help: 'The platform adds a bonus on top of what the hashrate mines.', sub: m.profit ? `${fmtPct(m.bonus / m.profit, 0)} of total profit` : '' })}
     ${card('From mining itself', m.mining, { sign: true, tone: tone(m.mining), help: 'Profit without the bonus. Near zero means the mining only covers the contract price.' })}
-    ${card('Loss days', m.lossBtc, { sign: true, tone: m.lossBtc < 0 ? 'neg' : '', help: 'Days where the payout was less than the capital due back. The shortfall is lost capital.', sub: plural(m.lossDays, 'day') })}
-    ${card('Entry cost gaps', -m.gap, { sign: true, tone: m.gap > 0 ? 'neg' : '', help: 'Paid for contracts minus what was actually allocated to them. Seen on some purchases; cause unknown.', sub: m.profit > 0 && m.gap > 0 ? `${fmtPct(m.gap / m.profit, 0)} of profit` : '' })}
-  </div>
+    ${card('Loss days', m.lossBtc, { sign: true, tone: m.lossBtc < 0 ? 'neg' : '', help: 'Days where the payout was less than the capital due back. The shortfall is lost capital.', sub: plural(m.lossDays, 'day') })}  </div>
 
   <h2>Right now</h2>
   <div class="grid">
@@ -782,21 +777,18 @@ function drawOverviewCharts(R) {
     options: { ...base, scales: { ...base.scales, y: yAxis({ beginAtZero: true }) } },
   });
 
-  let cp = 0, cw = 0, cg = 0;
+  let cp = 0, cw = 0;
   const cum = span.map(d => {
     cp += sum(days.filter(x => x.date === d), 'profit');
     cw += sum(R.W.filter(p => p.requested === d), 'btc');
-    cg += sum(R.P.filter(p => p.date === d), p => p.paidBtc - p.allocBtc);
-    return { p: cp * k, w: cw * k, n: (cp - cg) * k };
+    return { p: cp * k, w: cw * k };
   });
   charts.cumul = new Chart($('#chCumul'), {
     type: 'line',
     data: {
       labels: span.map(dayLabel),
       datasets: [
-        { label: 'Profit', data: cum.map(c => c.p), borderColor: v('--chart-1'), pointRadius: 0, borderWidth: 2 },
-        { label: 'Net (after entry gaps)', data: cum.map(c => c.n), borderColor: v('--chart-3'), pointRadius: 0, borderWidth: 2 },
-        { label: 'Withdrawn', data: cum.map(c => c.w), borderColor: v('--chart-2'), pointRadius: 0, borderWidth: 2, stepped: true },
+        { label: 'Profit', data: cum.map(c => c.p), borderColor: v('--chart-1'), pointRadius: 0, borderWidth: 2 },        { label: 'Withdrawn', data: cum.map(c => c.w), borderColor: v('--chart-2'), pointRadius: 0, borderWidth: 2, stepped: true },
       ],
     },
     options: { ...base, scales: { ...base.scales, y: yAxis() } },
@@ -837,7 +829,7 @@ function renderContracts(R) {
   const hasS = rows.some(r => r.s);
   const u = unitLabel();
   const t = {
-    th: sum(rows, 'th'), paid: sum(rows, 'paidBtc'), alloc: sum(rows, 'allocBtc'), gap: sum(rows, 'gap'),
+    th: sum(rows, 'th'), cost: sum(rows, 'allocBtc'),
     earned: sum(rows, r => r.s?.earnedBtc || 0), cb: sum(rows, r => r.s?.capitalBackBtc || 0), pr: sum(rows, r => r.s?.profitBtc || 0),
     sf: sum(rows, r => (r.s && !r.active ? r.shortfall : 0)),
   };
@@ -851,21 +843,19 @@ function renderContracts(R) {
   <h2>Contracts</h2>
   <p class="hint">Click a column heading to sort. ${hasS ? '"Capital lost" only counts ended contracts.' : 'Import the <b>profit-capital</b> report to see each contract\'s results.'}</p>
   <div class="table-wrap"><table data-sort-id="contracts">
-    <thead><tr><th>#</th><th>Bought</th><th>Ends</th><th>Status</th><th class="n">TH/s</th><th class="n">Paid (${u})</th><th class="n">Allocated (${u})</th><th class="n">Entry gap</th><th class="n">sats / TH</th>
+    <thead><tr><th>#</th><th>Bought</th><th>Ends</th><th>Status</th><th class="n">TH/s</th><th class="n">Cost (${u})</th><th class="n">sats / TH</th>
       ${hasS ? `<th class="n">Earned (${u})</th><th class="n">Capital back (${u})</th><th class="n">Profit (${u})</th><th class="n">Margin</th><th class="n">Capital lost</th>` : ''}</tr></thead>
     <tbody>
     ${rows.map(r => `<tr>
       ${td(r.num, r.num, '')}${td(r.date, fmtDate(r.date), '')}${td(r.end, fmtDate(r.end), '')}${td(r.active ? 0 : 1, esc(r.state), '')}
-      ${td(r.th, r.th.toLocaleString('en-US'))}${td(r.paidBtc, fmtAmt(r.paidBtc))}${td(r.allocBtc, fmtAmt(r.allocBtc))}
-      ${td(-r.gap, Math.abs(r.gap) < 1e-8 ? '—' : fmtAmt(-r.gap, true) + ` <small>(${fmtPct(r.gap / r.paidBtc, 1)})</small>`, 'n ' + (r.gap > 1e-8 ? 'neg' : ''))}
+      ${td(r.th, r.th.toLocaleString('en-US'))}${td(r.allocBtc, fmtAmt(r.allocBtc))}
       ${td(r.satsPerTh, r.satsPerTh.toFixed(0))}
       ${hasS ? (r.s ? `${td(r.s.earnedBtc, fmtAmt(r.s.earnedBtc))}${td(r.s.capitalBackBtc, fmtAmt(r.s.capitalBackBtc))}
         ${td(r.s.profitBtc, fmtAmt(r.s.profitBtc, true), 'n ' + tone(r.s.profitBtc))}${td(r.s.marginPct, isFinite(r.s.marginPct) ? r.s.marginPct.toFixed(2) + '%' : '—')}
         ${td(r.active ? 0 : -r.shortfall, r.active ? '<small>running</small>' : r.shortfall > 1e-8 ? fmtAmt(-r.shortfall, true) : '—', 'n ' + (!r.active && r.shortfall > 1e-8 ? 'neg' : ''))}`
         : '<td colspan="5" class="hint">no results imported</td>') : ''}
     </tr>`).join('')}
-    <tr class="total"><td colspan="4">Total (${rows.length})</td><td class="n">${t.th.toLocaleString('en-US')}</td><td class="n">${fmtAmt(t.paid)}</td><td class="n">${fmtAmt(t.alloc)}</td>
-      <td class="n ${t.gap > 1e-8 ? 'neg' : ''}">${fmtAmt(-t.gap, true)}</td><td></td>
+    <tr class="total"><td colspan="4">Total (${rows.length})</td><td class="n">${t.th.toLocaleString('en-US')}</td><td class="n">${fmtAmt(t.cost)}</td><td></td>
       ${hasS ? `<td class="n">${fmtAmt(t.earned)}</td><td class="n">${fmtAmt(t.cb)}</td><td class="n ${tone(t.pr)}">${fmtAmt(t.pr, true)}</td><td class="n">${t.cb ? fmtPct(t.pr / t.cb, 2) : '—'}</td><td class="n ${t.sf > 1e-8 ? 'neg' : ''}">${fmtAmt(-t.sf, true)}</td>` : ''}</tr>
     </tbody>
   </table></div>`;
