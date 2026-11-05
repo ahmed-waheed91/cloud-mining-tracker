@@ -4,7 +4,7 @@
 // Data lives in a folder the user picks (File System Access API, Chrome): cloud-mining.json
 // plus daily backups. It is mirrored to localStorage so nothing is lost while disconnected.
 
-const APP_VERSION = '1.7.0';
+const APP_VERSION = '1.7.1';
 const DATA_VERSION = 2;
 const STORAGE_KEY = 'cloud-mining-data';
 const PREFS_KEY = 'cloud-mining-prefs';
@@ -925,7 +925,34 @@ if (typeof Chart !== 'undefined') {
     afterDatasetDraw(chart, { meta }) { if (meta._glow) { chart.ctx.restore(); meta._glow = false; } },
   });
 }
-const dayLabel = d => new Date(d + 'T00:00:00').toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
+// Two y-axes (left `y`, right `y1`) whose 0 sits at the same height, so a value below 0 on either side
+// is drawn below the same zero line.
+function alignedZero(left, right, yAxis) {
+  const ext = vals => {
+    const f = vals.filter(isFinite);
+    return { lo: Math.min(0, ...f), hi: Math.max(0, ...f) };
+  };
+  const L = ext(left), Rr = ext(right);
+  const hiL = L.hi || 1, hiR = Rr.hi || 1;
+  const neg = Math.max(-L.lo / hiL, -Rr.lo / hiR); // how far below 0 the chart reaches, as a share of the top
+  const pad = 1.08;
+  return {
+    y: yAxis({ min: -neg * hiL * pad, max: hiL * pad, ticks: { ...yAxis().ticks, maxTicksLimit: 7 } }),
+    y1: yAxis({ position: 'right', min: -neg * hiR * pad, max: hiR * pad, grid: { drawOnChartArea: false }, ticks: { ...yAxis().ticks, maxTicksLimit: 7, callback: x => `${+x.toFixed(3)}%` } }),
+  };
+}
+// A thin line at 0 on the left axis.
+const zeroLine = color => ({
+  id: 'zeroLine',
+  afterDatasetsDraw(chart) {
+    const y = chart.scales.y?.getPixelForValue(0), a = chart.chartArea;
+    if (!isFinite(y) || !a) return;
+    const c = chart.ctx;
+    c.save(); c.strokeStyle = color; c.globalAlpha = 0.6; c.lineWidth = 1; c.setLineDash([4, 4]);
+    c.beginPath(); c.moveTo(a.left, y); c.lineTo(a.right, y); c.stroke(); c.restore();
+  },
+});
+const dayLabel = d =>new Date(d + 'T00:00:00').toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
 
 function drawOverviewCharts(R) {
   const el = $("#chOverview");
@@ -942,7 +969,8 @@ function drawOverviewCharts(R) {
         { type: 'line', label: 'Return/day %', data: days.map(d => d.ret * 100), borderColor: v('--chart-2'), pointRadius: 0, borderWidth: 2, yAxisID: 'y1' },
       ],
     },
-    options: { ...base, scales: { ...base.scales, y: yAxis(), y1: yAxis({ position: 'right', grid: { drawOnChartArea: false } }) } },
+    options: { ...base, scales: { ...base.scales, ...alignedZero(days.map(d => d.profit * k), days.map(d => d.ret * 100), yAxis) } },
+    plugins: [zeroLine(v('--muted'))],
   });
 
   const first = days[0].date, last = days.at(-1).date;
