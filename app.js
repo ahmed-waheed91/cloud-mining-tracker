@@ -4,8 +4,8 @@
 // Data lives in a folder the user picks (File System Access API, Chrome): cloud-mining.json
 // plus daily backups. It is mirrored to localStorage so nothing is lost while disconnected.
 
-const APP_VERSION = '1.7.1';
-const DATA_VERSION = 2;
+const APP_VERSION = '1.8.0';
+const DATA_VERSION = 3; // 3: deposits may have outside: true (paid straight for admin-added contracts)
 const STORAGE_KEY = 'cloud-mining-data';
 const PREFS_KEY = 'cloud-mining-prefs';
 const DATA_FILE = 'cloud-mining.json';
@@ -46,7 +46,7 @@ function emptyData() {
   return {
     version: DATA_VERSION, savedAt: null,
     cycles: [],        // {id, name, start, notes, reinvestFrom, blockTh, blockPrice, blockPriceDate, payoutFrom, withdrawThreshold (payout amount); old reinvestThreshold is no longer used}
-    deposits: [],      // {id, cycleId, date, btc, kind: 'new'|'carry', note}
+    deposits: [],      // {id, cycleId, date, btc, usd, kind: 'new'|'recycled' (withdrawn BTC sent back)|'carry', outside, orders, note}
     balanceChecks: [], // {id, date, btc, note}
     purchases: [],     // from hashrate-purchases report, one per order #
     earnings: [],      // from daily earnings report, one per group per day
@@ -187,27 +187,38 @@ function importEarnings(body, file) {
 
 // Purchases: each order # appears as a "purchased" line (what you paid) and an
 // "allocated" line (what went into the contract). Merge into one record per #.
+// The two lines of an order usually share its #, but not always: a contract added by hand on the platform
+// (no "purchased" line) shifts every later contract's # by one. So each contract ("allocated" line, the
+// order's identity) is paired with the purchased line of the same day, start and TH/s, nearest # first.
 function importPurchases(body, file) {
-  const groups = new Map();
-  for (const r of body) {
-    const n = parseInt(r['#'], 10);
-    if (!n) continue;
-    if (!groups.has(n)) groups.set(n, []);
-    groups.get(n).push(r);
+  const rows = body.filter(r => parseInt(r['#'], 10));
+  const allocs = rows.filter(r => /alloc/i.test(r['Type'])).sort((a, b) => parseInt(a['#'], 10) - parseInt(b['#'], 10));
+  const buys = rows.filter(r => /purchas/i.test(r['Type']));
+  const key = r => `${r['Purchased']}|${r['Start']}|${num(r['TH/s'])}`;
+  const used = new Set();
+  const pairs = allocs.map(alloc => {
+    const n = parseInt(alloc['#'], 10);
+    const bought = buys.filter(b => !used.has(b) && key(b) === key(alloc))
+      .sort((x, y) => Math.abs(parseInt(x['#'], 10) - n) - Math.abs(parseInt(y['#'], 10) - n))[0] || null;
+    if (bought) used.add(bought);
+    return { n, alloc, bought };
+  });
+  // A purchased line with no contract yet keeps its own #, unless a contract already has that #.
+  for (const bought of buys) {
+    const n = parseInt(bought['#'], 10);
+    if (!used.has(bought) && !pairs.some(p => p.n === n)) pairs.push({ n, alloc: null, bought });
   }
   let added = 0, updated = 0;
-  for (const [n, rs] of groups) {
-    const bought = rs.find(r => /purchas/i.test(r['Type']));
-    const alloc = rs.find(r => /alloc/i.test(r['Type']));
-    const any = bought || alloc;
+  for (const { n, alloc, bought } of pairs) {
+    const any = alloc || bought;
     const prev = data.purchases.find(p => p.num === n);
     const rec = {
       num: n,
       date: any['Purchased'], start: any['Start'], end: any['End'],
       th: num(any['TH/s']), days: num(any['Days']) || CONTRACT_DAYS,
-      paidBtc: bought ? num(bought['Paid BTC']) : prev?.paidBtc ?? num(alloc['Paid BTC']),
+      paidBtc: num((bought || alloc)['Paid BTC']),
       allocBtc: alloc ? num(alloc['Paid BTC']) : prev?.allocBtc ?? num(bought['Paid BTC']),
-      paidUsd: bought ? num(bought['Paid USD']) : prev?.paidUsd ?? NaN,
+      paidUsd: bought ? num(bought['Paid USD']) : alloc ? NaN : prev?.paidUsd ?? NaN,
       // USD at the moment of purchase: the USDT paid, or the BTC at that time's price
       allocUsd: alloc ? num(alloc['Paid USD']) : prev?.allocUsd ?? null,
       contractId: alloc ? alloc['Contract'] : prev?.contractId ?? '',
@@ -329,22 +340,37 @@ function compute(scope) {
     d.bonus += r.bonusBtc; d.base += r.baseBtc; d.rows++;
   }
   const days = [...byDay.values()].sort(byDate);
-  for (const d of days) d.ret = d.cost > 0 ? d.profit / (d.cost * CONTRACT_DAYS) : NaN;
+  const I = insights();
+  for (const d of days) {
+    d.ret = d.cost > 0 ? d.profit / (d.cost * CONTRACT_DAYS) : NaN;
+    // Capital the report took back for a contract that wasn't mining that day.
+    d.idle = I.idleByDay.get(d.date) || 0;
+  }
 
   const m = {};
-  m.in = sum(D, 'btc');
+  // BTC withdrawn and later sent back in is neither new money in nor money kept: it is taken off both.
+  // (Balance and net come out the same either way.)
+  m.recycled = sum(D.filter(d => d.kind === 'recycled'), 'btc');
+  m.in = sum(D, 'btc') - m.recycled;
+  // Money paid straight for contracts added by the admin never reached the balance.
+  m.outsideIn = sum(D.filter(d => d.outside), 'btc');
   m.carriedOut = sum(carryOut, 'btc');
   // A contract's real cost is its allocated BTC. The report's "purchased" BTC on USDT-paid orders is
   // the USD converted at one report-wide rate, not what left the balance (checked against the dashboard).
   m.paid = sum(P, 'allocBtc');
-  m.alloc = m.paid;
+  m.admin = P.filter(isAdminAdded);
+  m.adminValue = sum(m.admin, contractValue);
+  m.alloc = m.paid + m.adminValue;
+  m.idle = I.idle.filter(x => days.some(d => x.dates.has(d.date)));
   m.received = sum(days, 'total');
   m.capBack = sum(days, 'cost');
   m.profit = sum(days, 'profit');
   m.bonus = sum(days, 'bonus');
   m.mining = m.profit - m.bonus;
-  m.withdrawn = sum(W, 'btc');
-  m.balance = m.in - m.paid + m.received - m.withdrawn - m.carriedOut;
+  m.paidOut = sum(W, 'btc');
+  m.withdrawn = m.paidOut - m.recycled;
+  // Everything sent to the platform reaches the balance, except money paid straight for admin-added contracts.
+  m.balance = sum(D.filter(d => !d.outside), 'btc') - m.paid + m.received - m.paidOut - m.carriedOut;
   m.outstanding = Math.max(0, m.alloc - m.capBack);
   m.onPlatform = m.balance + m.outstanding;
   m.net = m.withdrawn + m.carriedOut + m.onPlatform - m.in;
@@ -365,7 +391,7 @@ function compute(scope) {
   const active = P.filter(p => p.start <= today && today <= p.end);
   m.activeCount = active.length;
   m.activeTh = sum(active, 'th');
-  m.working = sum(active, 'allocBtc');
+  m.working = sum(active, contractValue);
 
   m.recovered = m.withdrawn + m.carriedOut;
   m.remaining = m.in - m.recovered;
@@ -377,8 +403,12 @@ function compute(scope) {
 
 function winStats(ds) {
   const cost = sum(ds, 'cost'), profit = sum(ds, 'profit');
+  const idle = sum(ds, d => d.idle || 0);
   return {
-    n: ds.length, profit, cost,
+    n: ds.length, profit, cost, idle,
+    // the same, leaving out capital taken back for contracts that weren't mining
+    adjPer30: idle > 0 && cost - idle > 0 ? (profit + idle) / (cost - idle) : NaN,
+    adjLossDays: ds.filter(d => d.profit + (d.idle || 0) < 0).length,
     daily: cost > 0 ? profit / (cost * CONTRACT_DAYS) : NaN,
     per30: cost > 0 ? profit / cost : NaN,
     annual: cost > 0 ? (profit / (cost * CONTRACT_DAYS)) * 365 : NaN,
@@ -391,7 +421,7 @@ function winStats(ds) {
 function balanceAt(scope, date) {
   const inS = d => scope === 'all' || cycleIdForDate(d) === scope;
   const le = d => d <= date;
-  const deps = (scope === 'all' ? data.deposits.filter(d => d.kind !== 'carry') : data.deposits.filter(d => d.cycleId === scope)).filter(d => le(d.date));
+  const deps = (scope === 'all' ? data.deposits.filter(d => d.kind !== 'carry') : data.deposits.filter(d => d.cycleId === scope)).filter(d => le(d.date) && !d.outside);
   const nc = scope === 'all' ? null : nextCycle(scope);
   const carry = nc ? data.deposits.filter(d => d.cycleId === nc.id && d.kind === 'carry' && le(d.date)) : [];
   const paid = sum(data.purchases.filter(p => inS(p.date) && le(p.date)), 'allocBtc');
@@ -400,6 +430,121 @@ function balanceAt(scope, date) {
   return sum(deps, 'btc') - paid + recv - out - sum(carry, 'btc');
 }
 
+// ---------- reading between the report lines ----------
+// Worked out from all imported data (not per cycle):
+//  - contracts added by hand on the platform: an allocated line with 0 BTC, so nothing left the balance.
+//    They are valued at what the daily report charges back for them (its "Cost" on days when only they
+//    and paid contracts with known prices run), else at the USD on their purchased line.
+//  - contracts on record that were not mining: the report's TH/s stays below the contracts running,
+//    by at least that contract's size, on most of its days — while its capital is still in "Cost".
+//  - purchases the platform balance could not have paid for: a day-by-day replay of the balance
+//    (deposits + earnings − payouts − purchases). The shortfall had to be new money.
+let insightMemo = null;
+function insights() {
+  const key = [data.earnings.length, data.earnings.at(-1)?.date, data.purchases.length, data.purchases.map(p => p.num + ':' + p.allocBtc).join(),
+    data.payouts.length, data.deposits.map(d => d.date + d.btc + d.kind + (d.outside ? 'o' : '')).join()].join('|');
+  if (insightMemo?.data === data && insightMemo.key === key) return insightMemo.v;
+  const v = { value: new Map(), rate: NaN, admin: [], idle: [], idleByDay: new Map(), gaps: [] };
+
+  const dayAgg = new Map();
+  for (const r of data.earnings) {
+    const x = dayAgg.get(r.date) || { th: 0, cost: 0, total: 0, btcUsd: r.btcUsd };
+    x.th += r.th || 0; x.cost += r.costBtc || 0; x.total += r.totalBtc || 0;
+    dayAgg.set(r.date, x);
+  }
+  const contracts = data.purchases.filter(p => p.contractId && p.th > 0);
+  const on = d => contracts.filter(p => p.start <= d && d <= p.end);
+  const len = p => p.days || CONTRACT_DAYS;
+  v.admin = contracts.filter(p => !(p.allocBtc > 0));
+
+  if (v.admin.length) {
+    // First and last days are part-days, so only days when no contract starts or ends are used.
+    const edges = new Set(contracts.flatMap(p => [p.start, p.end]));
+    const rates = [];
+    for (const [d, x] of dayAgg) {
+      if (edges.has(d)) continue;
+      const act = on(d);
+      const adminTh = sum(act.filter(p => !(p.allocBtc > 0)), 'th');
+      if (!adminTh) continue;
+      const r = (x.cost - sum(act.filter(p => p.allocBtc > 0), p => p.allocBtc / len(p))) / adminTh;
+      if (r > 0) rates.push(r);
+    }
+    rates.sort((a, b) => a - b);
+    v.rate = rates.length ? rates[Math.floor(rates.length / 2)] : NaN;
+    for (const p of v.admin) {
+      const price = dayAgg.get(p.date)?.btcUsd || dayPrices[p.date];
+      const val = isFinite(v.rate) ? p.th * len(p) * v.rate : p.paidUsd > 0 && price > 0 ? p.paidUsd / price : 0;
+      v.value.set(p.num, +val.toFixed(8));
+    }
+  }
+  const valueOf = p => (p.allocBtc > 0 ? p.allocBtc : v.value.get(p.num) || 0);
+
+  // Largest contracts first, so a missing 800 TH/s isn't blamed on a 300 TH/s one.
+  const gap = new Map([...dayAgg].map(([d, x]) => [d, sum(on(d), 'th') - x.th]));
+  for (const c of [...contracts].sort((a, b) => b.th - a.th)) {
+    const ds = [...dayAgg.keys()].filter(d => c.start <= d && d <= c.end).sort();
+    const idle = ds.filter(d => gap.get(d) >= c.th * 0.9);
+    if (idle.length < 3 || idle.length < ds.length * 0.5) continue;
+    for (const d of idle) gap.set(d, gap.get(d) - c.th);
+    const perDay = valueOf(c) / len(c);
+    v.idle.push({ p: c, days: ds.length, idleDays: idle.length, from: idle[0], to: idle.at(-1), perDay, dates: new Set(idle) });
+    for (const d of idle) v.idleByDay.set(d, (v.idleByDay.get(d) || 0) + perDay);
+  }
+
+  const deps = data.deposits.filter(d => d.kind !== 'carry' && !d.outside);
+  const pays = data.payouts.filter(p => !isFailed(p.status));
+  const buys = data.purchases.filter(p => p.allocBtc > 0).sort((a, b) => a.num - b.num);
+  const dates = [...new Set([...deps.map(d => d.date), ...pays.map(p => p.requested), ...buys.map(p => p.date), ...dayAgg.keys()])].sort();
+  // A payout can be dated before the earnings it pays out are credited here. That timing gap is kept
+  // apart as "ahead" and paid back from the next earnings, so it never counts as money needed, and a
+  // deposit added for a suggestion is never used to pay it back (which would make a new suggestion).
+  let cash = 0, ahead = 0;
+  for (const d of dates) {
+    cash -= sum(pays.filter(x => x.requested === d), 'btc');
+    if (cash < 0) { ahead -= cash; cash = 0; }
+    cash += sum(deps.filter(x => x.date === d), 'btc');
+    for (const p of buys.filter(x => x.date === d)) {
+      const short = Math.max(0, p.allocBtc - cash);
+      if (short > 1e-5) v.gaps.push({ date: d, p, short, full: short > p.allocBtc - 1e-5 });
+      cash = Math.max(0, cash + short - p.allocBtc);
+    }
+    const earned = dayAgg.get(d)?.total || 0;
+    const repay = Math.min(ahead, earned);
+    ahead -= repay; cash += earned - repay;
+  }
+  insightMemo = { data, key, v };
+  return v;
+}
+// Payouts that had reached the wallet by `date`, minus what is already recorded as sent back by then.
+const walletAvail = date => sum(data.payouts.filter(p => !isFailed(p.status) && payoutDate(p) <= date), 'btc')
+  - sum(data.deposits.filter(x => x.kind === 'recycled' && x.date <= date), 'btc');
+// The replay's shortfalls, one suggestion per day.
+function suggestedDeposits() {
+  const by = new Map();
+  for (const g of insights().gaps) {
+    const s = by.get(g.date) || { date: g.date, btc: 0, usd: 0, usdKnown: true, orders: [], partial: [] };
+    s.btc += g.short;
+    (g.full ? s.orders : s.partial).push(g.p.num);
+    if (g.full && g.p.allocUsd > 0) s.usd += g.p.allocUsd; else s.usdKnown = false;
+    by.set(g.date, s);
+  }
+  // Could it have been BTC withdrawn earlier and sent back? Only if that much had reached the wallet by
+  // then and wasn't already sent back. If not, at least part of it must be new money. If it could, the
+  // reports can't tell, so "sent back" is only a first guess for the user to check.
+  let used = 0;
+  return [...by.values()].sort(byDate).map(s => {
+    const btc = +s.btc.toFixed(8);
+    const avail = Math.max(0, +(walletAvail(s.date) - used).toFixed(8));
+    const pick = avail >= btc - 1e-8 ? 'recycled' : 'new';
+    if (pick === 'recycled') used += btc;
+    return { ...s, btc, usd: s.usdKnown ? +s.usd.toFixed(2) : null, avail, pick };
+  });
+}
+const isAdminAdded = p => !!p.contractId && p.th > 0 && !(p.allocBtc > 0);
+// What a contract really cost: its allocated BTC, or for a contract added by hand, its worked-out value.
+const contractValue = p => (p.allocBtc > 0 ? p.allocBtc : insights().value.get(p.num) || 0);
+const idleInfo = p => insights().idle.find(x => x.p.num === p.num) || null;
+
 function contractRows(P) {
   const today = todayIso();
   return P.map(p => {
@@ -407,7 +552,8 @@ function contractRows(P) {
     const daysLeft = daysBetween(today, p.end);
     return {
       ...p, s,
-      satsPerTh: (p.allocBtc / p.th) * 1e8,
+      value: contractValue(p), admin: isAdminAdded(p), idle: idleInfo(p),
+      satsPerTh: (contractValue(p) / p.th) * 1e8,
       state: today < p.start ? 'not started' : today > p.end ? 'ended' : `active · ${daysLeft + 1}d left`,
       active: today >= p.start && today <= p.end,
       shortfall: s ? s.costBtc - s.capitalBackBtc : NaN,
@@ -418,17 +564,21 @@ function contractRows(P) {
 function monthRows(R) {
   const months = new Map();
   const get = ym => {
-    if (!months.has(ym)) months.set(ym, { ym, days: 0, total: 0, cost: 0, profit: 0, bonus: 0, lossDays: 0, withdrawn: 0, bought: 0, boughtBtc: 0 });
+    if (!months.has(ym)) months.set(ym, { ym, days: 0, total: 0, cost: 0, profit: 0, bonus: 0, lossDays: 0, adjLossDays: 0, idle: 0, withdrawn: 0, bought: 0, boughtBtc: 0 });
     return months.get(ym);
   };
   for (const d of R.days) {
     const r = get(d.date.slice(0, 7));
-    r.days++; r.total += d.total; r.cost += d.cost; r.profit += d.profit; r.bonus += d.bonus;
+    r.days++; r.total += d.total; r.cost += d.cost; r.profit += d.profit; r.bonus += d.bonus; r.idle += d.idle || 0;
     if (d.profit < 0) r.lossDays++;
+    if (d.profit + (d.idle || 0) < 0) r.adjLossDays++;
   }
   for (const w of R.W) get(w.requested.slice(0, 7)).withdrawn += w.btc;
-  for (const p of R.P) { const r = get(p.date.slice(0, 7)); r.bought++; r.boughtBtc += p.allocBtc; }
-  return [...months.values()].sort((a, b) => (a.ym < b.ym ? -1 : 1)).map(r => ({ ...r, per30: r.cost > 0 ? r.profit / r.cost : NaN }));
+  for (const p of R.P) { const r = get(p.date.slice(0, 7)); r.bought++; r.boughtBtc += contractValue(p); }
+  return [...months.values()].sort((a, b) => (a.ym < b.ym ? -1 : 1)).map(r => ({
+    ...r, per30: r.cost > 0 ? r.profit / r.cost : NaN,
+    adjPer30: r.idle > 0 && r.cost - r.idle > 0 ? (r.profit + r.idle) / (r.cost - r.idle) : r.cost > 0 ? r.profit / r.cost : NaN,
+  }));
 }
 
 function warnings(R) {
@@ -451,7 +601,18 @@ function warnings(R) {
 
   const uncovered = [...new Set(data.earnings.map(e => e.date))].filter(d => !data.purchases.some(p => p.start <= d && d <= p.end));
   if (uncovered.length) add('warn', `${plural(uncovered.length, 'day')} of earnings (latest ${fmtDate(uncovered.sort().at(-1))}) have no matching contract. Import the latest <b>hashrate purchases</b> report.`);
-  else if (m.capBack > m.alloc + 1e-7) add('warn', 'More capital has come back than was put into contracts — a <b>hashrate purchases</b> report may be missing.');
+  else if (m.capBack > m.alloc + 1e-7 && !m.idle.length) add('warn', 'More capital has come back than was put into contracts — a <b>hashrate purchases</b> report may be missing.');
+
+  for (const x of m.idle) {
+    const inView = days.filter(d => x.dates.has(d.date));
+    const cost = sum(inView, 'cost'), profit = sum(inView, 'profit'), idle = sum(inView, 'idle');
+    const mined = x.days - x.idleDays;
+    add('warn', `<b>${esc(x.p.contractId)}</b> (${x.p.th.toLocaleString('en-US')} TH/s, ${fmtDate(x.p.start)} – ${fmtDate(x.p.end)}) is on record but the report's hashrate leaves it out on ${x.idleDays} of its ${x.days} days${mined > 0 ? ` — it only mined on ${plural(mined, 'day')}` : ''}. Its capital (${fmtAmtU(x.perDay)} a day) was still taken out of those days' earnings, so they look like losses that aren't real. Over those days: <b>${fmtPct(profit / cost, 2, true)}</b> per 30 days as the platform reports it, <b>${fmtPct((profit + idle) / (cost - idle), 2, true)}</b> without this contract. Ask the platform about it; if you didn't pay for it, it cost you nothing.`);
+  }
+  const unpaid = m.admin.filter(p => !data.deposits.some(d => d.outside && (d.orders || []).includes(p.num)) && !idleInfo(p));
+  if (unpaid.length) add('info', `${plural(unpaid.length, 'contract')} (#${unpaid.map(p => p.num).join(', #')}) ${unpaid.length === 1 ? 'was' : 'were'} added by the platform admin: no BTC left the balance for ${unpaid.length === 1 ? 'it' : 'them'}. If you paid for ${unpaid.length === 1 ? 'it' : 'them'} outside the platform, add ${unpaid.length === 1 ? 'it' : 'them'} as money in on the <b>Money in &amp; out</b> tab.`);
+  const gaps = suggestedDeposits();
+  if (gaps.length) add('info', `The reports show ${plural(gaps.length, 'day')} when contracts cost more than the balance had — ${fmtAmtU(sum(gaps, 'btc'))} of money in that isn't recorded. See <b>Suggested money in</b> on the Money in &amp; out tab.`);
 
   const checks = data.balanceChecks.filter(c => R.scope === 'all' || cycleIdForDate(c.date) === R.scope).sort(byDate);
   const lc = checks.at(-1);
@@ -845,7 +1006,7 @@ function renderHero(R) {
     <div class="hero-stats">
       ${m.in ? mini('Money in', m.in, 'BTC you sent to the platform for this cycle (including any balance carried over from the previous cycle).')
         : `<div class="mini"><div class="label">Money in</div><div class="v warn">none yet</div><div class="usd">Add it on the Money in &amp; out tab.</div></div>`}
-      ${mini('Withdrawn to your wallet', m.withdrawn, 'Payouts sent to your own wallet.', m.carriedOut ? `+ ${fmtAmt(m.carriedOut)} carried on` : plural(R.W.length, 'payout'))}
+      ${mini('Withdrawn to your wallet', m.withdrawn, m.recycled ? `Payouts sent to your own wallet (${fmtAmtU(m.paidOut)}), minus the ${fmtAmtU(m.recycled)} you sent back in to buy contracts.` : 'Payouts sent to your own wallet.', m.carriedOut ? `+ ${fmtAmt(m.carriedOut)} carried on` : m.recycled ? `${plural(R.W.length, 'payout')}, ${fmtAmt(m.recycled)} sent back` : plural(R.W.length, 'payout'))}
       ${mini('Still on the platform', m.onPlatform, `Your BTC that is still exposed to the platform: ${fmtAmtU(m.balance)} available balance plus ${fmtAmtU(m.outstanding)} of capital inside contracts that has not come back yet.`)}
     </div>
   </section>`;
@@ -866,6 +1027,8 @@ function renderRunning(R) {
       <span class="dot">·</span> <span class="${tone(x.profit)}">${fmtAmt(x.profit, true)} ${unitLabel()}</span> <span class="muted">profit${fiat(x.profit) ? ` (${fiat(x.profit)})` : ''}</span>
       <span class="dot">·</span> <span class="${x.lossDays ? 'neg' : ''}">${plural(x.lossDays, 'loss day')}</span> <span class="muted">of ${x.n}</span>
     </div>
+    ${x.idle > 0 ? `<div class="running-line hint">As the platform reports it. Without the contract that wasn't mining:
+      <b class="${tone(x.adjPer30)}">${fmtPct(x.adjPer30, 2)}</b> per 30 days · ${plural(x.adjLossDays, 'loss day')} ${help('The report kept taking capital back for a contract its hashrate left out, so those days look worse than they were. This leaves that capital out. See the warning above.')}</div>` : ''}
   </section>`;
 }
 
@@ -980,7 +1143,7 @@ function drawOverviewCharts(R) {
     type: 'line',
     data: {
       labels: span.map(dayLabel),
-      datasets: [{ label: 'Capital working', data: span.map(d => sum(R.P.filter(p => p.start <= d && d <= p.end), 'allocBtc') * k), borderColor: v('--chart-1'), backgroundColor: fade(alpha(v('--chart-1'), 0.35), alpha(v('--chart-1'), 0)), fill: true, pointRadius: 0, stepped: true }],
+      datasets: [{ label: 'Capital working', data: span.map(d => sum(R.P.filter(p => p.start <= d && d <= p.end), contractValue) * k), borderColor: v('--chart-1'), backgroundColor: fade(alpha(v('--chart-1'), 0.35), alpha(v('--chart-1'), 0)), fill: true, pointRadius: 0, stepped: true }],
     },
     options: { ...base, scales: { ...base.scales, y: yAxis({ beginAtZero: true }) } },
   });
@@ -1034,8 +1197,9 @@ function drawContractChart(R) {
 // A contract's USD cost: the purchases report's figure, else BTC × that day's average price (an estimate).
 function contractUsd(p) {
   if (p.allocUsd > 0) return { usd: p.allocUsd, est: false };
+  if (isAdminAdded(p) && p.paidUsd > 0) return { usd: p.paidUsd, est: false };
   const price = dayPrices[p.date];
-  return price > 0 ? { usd: p.allocBtc * price, est: true } : { usd: NaN, est: false };
+  return price > 0 ? { usd: contractValue(p) * price, est: true } : { usd: NaN, est: false };
 }
 function usdCell(p) {
   const { usd, est } = contractUsd(p);
@@ -1050,7 +1214,7 @@ function renderContracts(R) {
   const hasS = rows.some(r => r.s);
   const u = unitLabel();
   const t = {
-    th: sum(rows, 'th'), cost: sum(rows, 'allocBtc'), usd: sum(rows, r => contractUsd(r).usd || 0),
+    th: sum(rows, 'th'), cost: sum(rows, 'value'), usd: sum(rows, r => contractUsd(r).usd || 0),
     usdEst: rows.some(r => contractUsd(r).est), usdMissing: rows.some(r => !isFinite(contractUsd(r).usd)),
     earned: sum(rows, r => r.s?.earnedBtc || 0), cb: sum(rows, r => r.s?.capitalBackBtc || 0), pr: sum(rows, r => r.s?.profitBtc || 0),
     sf: sum(rows, r => (r.s && !r.active ? r.shortfall : 0)),
@@ -1069,8 +1233,9 @@ function renderContracts(R) {
       ${hasS ? `<th class="n">Earned (${u})</th><th class="n">Capital back (${u})</th><th class="n">Profit (${u})</th><th class="n">Margin</th><th class="n">Capital lost</th>` : ''}</tr></thead>
     <tbody>
     ${rows.map(r => `<tr>
-      ${td(r.num, r.num, '')}${td(r.date, fmtDate(r.date), '')}${td(r.end, fmtDate(r.end), '')}${td(r.active ? 0 : 1, esc(r.state), '')}
-      ${td(r.th, r.th.toLocaleString('en-US'))}${td(r.allocBtc, fmtAmt(r.allocBtc))}${usdCell(r)}
+      ${td(r.num, r.num, '')}${td(r.date, fmtDate(r.date), '')}${td(r.end, fmtDate(r.end), '')}
+      ${td(r.active ? 0 : 1, esc(r.state) + (r.idle ? ` <span class="tag warn" title="The report's hashrate leaves this contract out on ${r.idle.idleDays} of its ${r.idle.days} days, but its capital was still taken back.">not mining ${r.idle.idleDays} of ${r.idle.days} days</span>` : '') + (r.admin ? ` <span class="tag" title="Its allocated BTC is 0: it was added by the platform admin, not bought from your balance. The cost shown is what the daily report charges back for it.">added by admin</span>` : ''), '')}
+      ${td(r.th, r.th.toLocaleString('en-US'))}${td(r.value, r.admin ? `<span title="Worked out: what the daily report charges back for it (no BTC was allocated).">~${fmtAmt(r.value)}</span>` : fmtAmt(r.value))}${usdCell(r)}
       ${td(r.satsPerTh, r.satsPerTh.toFixed(0))}
       ${hasS ? (r.s ? `${td(r.s.earnedBtc, fmtAmt(r.s.earnedBtc))}${td(r.s.capitalBackBtc, fmtAmt(r.s.capitalBackBtc))}
         ${td(r.s.profitBtc, fmtAmt(r.s.profitBtc, true), 'n ' + tone(r.s.profitBtc))}${td(r.s.marginPct, isFinite(r.s.marginPct) ? r.s.marginPct.toFixed(2) + '%' : '—')}
@@ -1110,15 +1275,18 @@ function renderHistory(R) {
     dailyBody = [...R.days].reverse().map(dayRow).join('');
   }
 
+  const anyIdle = months.some(mo => mo.idle > 0);
   return `
   <h2>Monthly summary</h2>
-  <p class="hint">Calendar months. Return per 30 days = profit ÷ capital back in that month.</p>
+  <p class="hint">Calendar months. Return per 30 days = profit ÷ capital back in that month.${anyIdle ? ' "Without idle contract" leaves out the capital the report took back for a contract that wasn\'t mining (see the warning on the Overview).' : ''}</p>
   <div class="table-wrap"><table data-sort-id="months">
-    <thead><tr><th>Month</th><th class="n">Days</th><th class="n">Received (${u})</th><th class="n">Profit (${u})</th><th class="n">Profit ${cur} (now)</th><th class="n">Return / 30 days</th><th class="n">Loss days</th><th class="n">Withdrawn (${u})</th><th class="n">Contracts bought</th></tr></thead>
+    <thead><tr><th>Month</th><th class="n">Days</th><th class="n">Received (${u})</th><th class="n">Profit (${u})</th><th class="n">Profit ${cur} (now)</th><th class="n">Return / 30 days</th>${anyIdle ? `<th class="n">Without idle contract ${help('Return per 30 days and loss days if the capital taken back for the contract that wasn\'t mining is left out.')}</th>` : ''}<th class="n">Loss days</th><th class="n">Withdrawn (${u})</th><th class="n">Contracts bought</th></tr></thead>
     <tbody>${[...months].reverse().map(mo => `<tr>
       ${td(mo.ym, fmtMonth(mo.ym), '')}${td(mo.days, mo.days)}${td(mo.total, fmtAmt(mo.total))}
       ${td(mo.profit, fmtAmt(mo.profit, true), 'n ' + tone(mo.profit))}${td(mo.profit, fiat(mo.profit) || '—')}
-      ${td(mo.per30, fmtPct(mo.per30, 2, true), 'n ' + tone(mo.per30))}${td(mo.lossDays, mo.lossDays || '—', 'n ' + (mo.lossDays ? 'neg' : ''))}
+      ${td(mo.per30, fmtPct(mo.per30, 2, true), 'n ' + tone(mo.per30))}
+      ${anyIdle ? td(mo.adjPer30, mo.idle > 0 ? `<b>${fmtPct(mo.adjPer30, 2, true)}</b> <small>· ${plural(mo.adjLossDays, 'loss day')}</small>` : '<small>same</small>', 'n ' + (mo.idle > 0 ? tone(mo.adjPer30) : '')) : ''}
+      ${td(mo.lossDays, mo.lossDays || '—', 'n ' + (mo.lossDays ? 'neg' : ''))}
       ${td(mo.withdrawn, mo.withdrawn ? fmtAmt(mo.withdrawn) : '—')}${td(mo.bought, mo.bought ? `${mo.bought} <small>(${fmtAmt(mo.boughtBtc)})</small>` : '—')}
     </tr>`).join('')}</tbody>
   </table></div>
@@ -1165,7 +1333,7 @@ function projSetup(R) {
   const mine = cyc?.reinvestFrom || 'capital';
   const start = m.last || todayIso();
   // Start from the contracts still running and the balance; a different capital scales them.
-  let contracts = R.P.filter(p => p.end > start).map(p => ({ btc: p.allocBtc, left: Math.min(CONTRACT_DAYS, daysBetween(start, p.end)) }));
+  let contracts = R.P.filter(p => p.end > start && !idleInfo(p)).map(p => ({ btc: contractValue(p), left: Math.min(CONTRACT_DAYS, daysBetween(start, p.end)) }));
   const inContracts = sum(contracts, c => (c.btc * c.left) / CONTRACT_DAYS);
   let balance = capital - inContracts;
   if (balance < 0) { contracts = contracts.map(c => ({ ...c, btc: (c.btc * capital) / inContracts })); balance = 0; }
@@ -1352,17 +1520,35 @@ function renderMoney(R) {
   const payVals = payouts.map(payoutUsd);
   const usedOrders = new Set(data.deposits.flatMap(d => d.orders || []));
   const orderChoices = R.P.filter(p => p.allocUsd > 0 && !usedOrders.has(p.num));
-  const needReimport = R.P.some(p => !(p.allocUsd > 0));
+  const needReimport = R.P.some(p => !(p.allocUsd > 0) && !isAdminAdded(p));
+  const adminChoices = data.purchases.filter(p => isAdminAdded(p) && !usedOrders.has(p.num));
+  const suggestions = suggestedDeposits();
+  const orderList = list => list.map(p => `#${p}`).join(', ');
 
   return `${renderFiatResult(R)}
   <div class="cols"><div>
   <h2>Deposits (money in)</h2>
-  <p class="hint">Add every amount you send to the platform — the reports don't show deposits. When a new cycle starts with the leftover balance, add that as "Carried over". If you paid in USDT, type the USD amount too; otherwise the app estimates it from that day's average BTC price (marked ~).</p>
-  ${cs.length ? `<form class="inline" data-form="deposit">
+  <p class="hint">Add every amount you send to the platform — the reports don't show deposits. When a new cycle starts with the leftover balance, add that as "Carried over". If you paid in USDT, type the USD amount too; otherwise the app estimates it from that day's average BTC price (marked ~). If you only know the USD, leave BTC empty: the app works it out from that day's average BTC price.</p>
+  ${cs.length ? `${suggestions.length ? `<details class="panel" style="margin:10px 0" open>
+    <summary><b>Suggested money in</b> <span class="hint">· ${plural(suggestions.length, 'day')} · ${fmtAmtU(sum(suggestions, 'btc'))}</span></summary>
+    <p class="hint" style="margin-top:8px">The app replays your platform balance day by day from the reports (money in + earnings − payouts − contracts). On these days a contract cost more than the balance had, so the difference must have come in from outside. For each day, choose whether it was <b>new money</b> or <b>BTC you had withdrawn and sent back</b>. The app pre-picks "sent back" when enough of your payouts had reached your wallet by then, but the reports can't prove it either way, so check each one. ${help('Only days when the balance fell short are listed, so contracts paid from returned capital or profit never show here. Once added, a day disappears from this list. "Sent back" is taken off both money in and withdrawn; your net result is the same either way.')}</p>
+    <form data-form="deposit-suggested">
+      <div class="table-wrap"><table>
+        <thead><tr><th><input type="checkbox" data-act="tick-all" title="Tick all"></th><th>Date</th><th>For contracts</th><th class="n">${u} needed</th><th class="n">USD</th><th class="n">Payouts in your wallet ${help('BTC paid out to your wallet by that day and not yet marked as sent back: the most this day could have been paid with withdrawn BTC.')}</th><th>It was</th></tr></thead>
+        <tbody>${suggestions.map(s => `<tr><td><input type="checkbox" name="day" value="${s.date}"></td><td>${fmtDate(s.date)}</td>
+          <td>${orderList(s.orders)}${s.partial.length ? `${s.orders.length ? ', ' : ''}part of ${orderList(s.partial)}` : ''}</td>
+          <td class="n">${fmtAmt(s.btc)}</td><td class="n">${s.usd ? fmtMoney(s.usd) : '<span class="hint">estimate</span>'}</td>
+          <td class="n">${s.avail > 0 ? fmtAmt(s.avail) : '—'}</td>
+          <td><select name="as-${s.date}"><option value="new" ${s.pick === 'new' ? 'selected' : ''}>New money</option><option value="recycled" ${s.pick === 'recycled' ? 'selected' : ''} ${s.avail > 0 ? '' : 'disabled'}>Sent back from payouts</option></select></td></tr>`).join('')}</tbody>
+      </table></div>
+      <div class="inline" style="margin-top:8px"><button class="primary">Add the ticked days as deposits</button></div>
+    </form>
+  </details>` : ''}
+  <form class="inline" data-form="deposit">
     <label>Date<input type="date" name="date" value="${todayIso()}" required></label>
-    <label>BTC<input type="number" name="btc" step="0.00000001" min="0" required style="width:150px"></label>
-    <label>USD/USDT paid (optional)<input type="number" name="usd" step="0.01" min="0" style="width:130px"></label>
-    <label>Type<select name="kind"><option value="new">New BTC sent in</option><option value="carry">Carried over from previous cycle</option></select></label>
+    <label>BTC<input type="number" name="btc" step="0.00000001" min="0" style="width:150px" placeholder="from USD"></label>
+    <label>USD/USDT paid<input type="number" name="usd" step="0.01" min="0" style="width:130px" placeholder="optional"></label>
+    <label>Type<select name="kind"><option value="new">New BTC sent in</option><option value="recycled">Sent back from my payouts</option><option value="carry">Carried over from previous cycle</option></select></label>
     <label>Cycle${cycleSelect(defaultCycle)}</label>
     <label>Note<input name="note" style="width:220px"></label>
     <button class="primary">Add deposit</button>
@@ -1378,18 +1564,31 @@ function renderMoney(R) {
       </table></div>
       <div class="inline" style="margin-top:8px"><label>Cycle${cycleSelect(defaultCycle)}</label> <button class="primary">Add deposit for the ticked orders</button></div>
     </form>` : `<p class="hint">${needReimport ? 'Import the <b>hashrate purchases</b> report again to list your orders here.' : 'No orders left that aren\'t already part of a deposit.'}</p>`}
-  </details>` : `<div class="empty">Start a cycle first on the <b>Settings</b> tab.</div>`}
+  </details>
+  ${adminChoices.length ? `<details class="panel" style="margin:10px 0">
+    <summary><b>Contracts added by the platform admin</b> <span class="hint">· ${adminChoices.length} not counted as money in</span></summary>
+    <p class="hint" style="margin-top:8px">These contracts have 0 BTC allocated: they were added by hand, not bought from your balance. If you paid for them outside the platform (for example to the admin), tick them to add that as money in. It counts in your money in and net result, but not in your balance. The BTC is what the daily report charges back for each one; the USD is from its purchased line. Leave out any you didn't pay for.</p>
+    <form data-form="deposit-admin">
+      <div class="table-wrap"><table>
+        <thead><tr><th></th><th>#</th><th>Contract</th><th>Added</th><th class="n">TH/s</th><th class="n">${u}</th><th class="n">USD paid</th><th></th></tr></thead>
+        <tbody>${adminChoices.map(p => `<tr><td><input type="checkbox" name="order" value="${p.num}"></td><td>${p.num}</td><td>${esc(p.contractId)}</td><td>${fmtDate(p.date)}</td>
+          <td class="n">${p.th.toLocaleString('en-US')}</td><td class="n">${fmtAmt(contractValue(p))}</td><td class="n">${p.paidUsd > 0 ? fmtMoney(p.paidUsd) : '—'}</td>
+          <td class="hint">${idleInfo(p) ? 'no purchase line and not mining — only tick if you paid for it' : !(p.paidUsd > 0) ? 'no purchase line' : ''}</td></tr>`).join('')}</tbody>
+      </table></div>
+      <div class="inline" style="margin-top:8px"><label>Paid with<select name="kind"><option value="new">New money</option><option value="recycled">BTC I had withdrawn from the platform</option></select></label> <label>Cycle${cycleSelect(defaultCycle)}</label> <button class="primary">Add the ticked contracts</button></div>
+    </form>
+  </details>` : ''}` : `<div class="empty">Start a cycle first on the <b>Settings</b> tab.</div>`}
   ${deposits.length ? `<div class="table-wrap"><table>
     <thead><tr><th>Date</th><th>Cycle</th><th>Type</th><th class="n">${u}</th><th class="n">${cur} then</th><th class="n">${cur} now</th><th class="n">Change ${help('How much the value of that BTC has moved since, from the BTC price alone.')}</th><th>Note</th><th></th></tr></thead>
     <tbody>${deposits.map((d, i) => editing?.type === 'deposit' && editing.id === d.id
       ? `<tr data-edit="deposit" data-id="${d.id}"><td><input type="date" name="date" value="${d.date}"></td>
         <td>${cycleSelect(d.cycleId)}</td>
-        <td><select name="kind"><option value="new" ${d.kind !== 'carry' ? 'selected' : ''}>New BTC</option><option value="carry" ${d.kind === 'carry' ? 'selected' : ''}>Carried over</option></select></td>
+        <td><select name="kind"><option value="new" ${d.kind === 'new' || !d.kind ? 'selected' : ''}>New BTC</option><option value="recycled" ${d.kind === 'recycled' ? 'selected' : ''}>Sent back from payouts</option><option value="carry" ${d.kind === 'carry' ? 'selected' : ''}>Carried over</option></select></td>
         <td class="n"><input type="number" name="btc" step="0.00000001" min="0" value="${d.btc}" style="width:140px" title="BTC"></td>
         <td class="n"><input type="number" name="usd" step="0.01" min="0" value="${d.usd > 0 ? d.usd : ''}" style="width:110px" title="USD/USDT paid — leave empty to estimate" placeholder="estimate"></td><td></td><td></td>
         <td><input name="note" value="${esc(d.note)}" style="width:100%;min-width:200px"></td>
         <td class="actions"><button class="primary" data-act="save-edit">Save</button><button data-act="cancel-edit">Cancel</button></td></tr>`
-      : `<tr><td>${fmtDate(d.date)}</td><td>${cycleName(d.cycleId)}</td><td>${d.kind === 'carry' ? 'Carried over' : 'New BTC'}</td>
+      : `<tr><td>${fmtDate(d.date)}</td><td>${cycleName(d.cycleId)}</td><td>${d.kind === 'carry' ? 'Carried over' : d.kind === 'recycled' ? `Sent back ${help('BTC you had withdrawn to your wallet and sent back in to buy contracts. It is taken off both money in and withdrawn.')}` : d.outside ? `Paid outside ${help('Paid for contracts added by the admin. Counts as money in, but never reached your platform balance.')}` : 'New BTC'}</td>
         <td class="n">${fmtAmt(d.btc)}</td>${valueCells(depVals[i], d.btc, estDay)}<td class="note">${esc(d.note)}</td>
         <td class="actions"><button data-act="edit" data-type="deposit" data-id="${d.id}">Edit</button><button class="danger" data-act="del-deposit" data-id="${d.id}">Delete</button></td></tr>`).join('')}
     ${deposits.length > 1 ? `<tr class="total"><td colspan="3">Total (${deposits.length})</td><td class="n">${fmtAmt(sum(deposits, 'btc'))}</td>${valueCells(sumUsd(depVals), sum(deposits, 'btc'), 'Includes estimates.')}<td></td><td></td></tr>` : ''}</tbody>
@@ -1439,8 +1638,10 @@ function renderFiatResult(R) {
   if (!R.D.length || !price) return '';
   const nc = R.scope === 'all' ? null : nextCycle(R.scope);
   const carry = nc ? data.deposits.filter(d => d.cycleId === nc.id && d.kind === 'carry') : [];
-  const inV = sumUsd(R.D.map(depositUsd));
-  const outV = sumUsd([...R.W.map(payoutUsd), ...carry.map(depositUsd)]);
+  // BTC sent back from payouts is taken off both sides, at its value on the day it was sent back.
+  const back = R.D.filter(d => d.kind === 'recycled').map(depositUsd).map(v => ({ ...v, usd: -v.usd }));
+  const inV = sumUsd(R.D.filter(d => d.kind !== 'recycled').map(depositUsd));
+  const outV = sumUsd([...R.W.map(payoutUsd), ...carry.map(depositUsd), ...back]);
   const left = m.onPlatform * price;
   const result = outV.usd + left - inV.usd;
   const est = inV.est || outV.est;
@@ -1575,6 +1776,9 @@ function renderSettings() {
     <li>Click <b>Import reports</b> or drag the CSVs onto this page. Importing the same report twice is safe — rows are refreshed, not doubled. Reinvestments come in automatically with the purchases report.</li>
     <li>Record the money you send in on the <b>Money in &amp; out</b> tab — reports don't show deposits. If you paid for orders in USDT, use <b>Add a deposit from orders you paid in USDT</b> there, so the exact BTC and USD come from the report.</li>
     <li>A contract's cost is the BTC allocated to it. On orders paid in USDT, the report's "purchased" BTC is only the USD converted at one rate for the whole report, so the app ignores it.</li>
+    <li>A contract with 0 BTC allocated was added by the platform admin. The app values it at what the daily report charges back for it and lists it on the Money in &amp; out tab, so you can add what you paid for it outside the platform.</li>
+    <li>If the report's hashrate leaves out a contract on record for most of its days while still taking its capital back, the app warns about it and shows the returns both ways: as the platform reports them, and without that contract.</li>
+    <li>"Suggested money in" replays the platform balance day by day from the reports. On days a contract cost more than the balance had, the difference must have come in from outside: new money, or BTC you had withdrawn and sent back. Mark the second kind "Sent back from payouts": it is taken off both money in and withdrawn, so those figures show what really came from your pocket and what really stayed in your wallet.</li>
     <li>Now and then add a <b>balance check</b> from the dashboard to confirm the numbers line up. The platform settles each day early the next day, so a check usually matches the earnings up to the day before.</li>
   </ol>
   <p class="hint" style="margin:10px 0 0">Your data never leaves this computer. The app only fetches BTC prices from the internet: today's, and the daily averages for estimates. Version ${APP_VERSION}.</p></div>
@@ -1823,6 +2027,22 @@ function depositUsd(d) {
   const price = dayPrices[d.date];
   return price > 0 ? { usd: d.btc * price, est: true } : { usd: NaN, est: false };
 }
+// BTC for a USD amount on a given day: that day's average price, else the report's price that day,
+// else today's live price (for today only). null if none can be found.
+async function usdToBtc(usd, date) {
+  if (!(dayPrices[date] > 0) && date <= todayIso()) {
+    try {
+      const url = `https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=86400&start=${date}T00:00:00Z&end=${addDays(date, 1)}T00:00:00Z`;
+      const hit = (await (await fetch(url)).json()).find(([t]) => new Date(t * 1000).toISOString().slice(0, 10) === date);
+      if (hit) { const [, lo, hi, op, cl] = hit; dayPrices[date] = (lo + hi + op + cl) / 4; }
+    } catch { /* offline */ }
+  }
+  const rep = data.earnings.find(e => e.date === date && e.btcUsd > 0)?.btcUsd;
+  const [price, src] = dayPrices[date] > 0 ? [dayPrices[date], `the ${fmtDate(date)} average of ${fmtMoney(dayPrices[date])}`]
+    : rep ? [rep, `the report's price that day (${fmtMoney(rep)})`]
+    : date === todayIso() && btcUsd ? [btcUsd, `today's price (${fmtMoney(btcUsd)})`] : [null, ''];
+  return price ? { btc: +(usd / price).toFixed(8), src } : null;
+}
 function payoutUsd(p) {
   const price = dayPrices[payoutDate(p)];
   return price > 0 ? { usd: p.btc * price, est: true } : { usd: NaN, est: false };
@@ -1907,6 +2127,7 @@ function bind() {
       return;
     }
     const b = e.target.closest('[data-act]');
+    if (b?.dataset.act === 'tick-all') { b.closest('form').querySelectorAll('input[name="day"]').forEach(i => { i.checked = b.checked; }); return; }
     if (!b || b.tagName === 'INPUT') return;
     const act = b.dataset.act, id = b.dataset.id;
     if (act === 'open-folder') openFolder();
@@ -1927,6 +2148,11 @@ function bind() {
     else if (act === 'save-edit') {
       const tr = b.closest('tr[data-edit]');
       const v = Object.fromEntries([...tr.querySelectorAll('[name]')].map(i => [i.name, i.value]));
+      if (tr.dataset.edit === 'deposit' && isIso(v.date) && v.btc.trim() === '' && num(v.usd) > 0) {
+        const r = await usdToBtc(num(v.usd), v.date);
+        if (!r) { toast(`No BTC price found for ${fmtDate(v.date)}. Type the BTC amount instead.`, true); return; }
+        v.btc = String(r.btc);
+      }
       if (!isIso(v.date) || !(num(v.btc) >= 0)) { toast('Enter a valid date and BTC amount.', true); return; }
       const list = tr.dataset.edit === 'deposit' ? data.deposits : data.balanceChecks;
       const rec = list.find(x => x.id === tr.dataset.id);
@@ -1992,7 +2218,47 @@ function bind() {
     }
     if (form.dataset.form === 'cycle-settings') return; // fields save as they change
     if (form.dataset.form === 'deposit') {
-      data.deposits.push({ id: uid(), cycleId: f.cycleId, date: f.date, btc: num(f.btc), usd: num(f.usd) > 0 ? num(f.usd) : null, kind: f.kind, note: f.note.trim() });
+      const rec = { id: uid(), cycleId: f.cycleId, date: f.date, btc: num(f.btc), usd: num(f.usd) > 0 ? num(f.usd) : null, kind: f.kind, note: f.note.trim() };
+      if (num(f.btc) > 0) data.deposits.push(rec);
+      else if (rec.usd) {
+        usdToBtc(rec.usd, rec.date).then(r => {
+          if (!r) { toast(`No BTC price found for ${fmtDate(rec.date)} (this needs an internet connection). Type the BTC amount instead.`, true); return; }
+          rec.btc = r.btc;
+          rec.note = [rec.note, `BTC worked out from ${fmtMoney(rec.usd)} at ${r.src}`].filter(Boolean).join(' · ');
+          data.deposits.push(rec); save(); render(); toast(`Added: ${fmtAmtU(r.btc)}`);
+        });
+        return;
+      } else { toast('Type a BTC amount, or a USD amount for the app to convert.', true); return; }
+    } else if (form.dataset.form === 'deposit-suggested') {
+      const picked = new Set([...form.querySelectorAll('input[name="day"]:checked')].map(i => i.value));
+      const ss = suggestedDeposits().filter(s => picked.has(s.date));
+      if (!ss.length) { toast('Tick the days to add first.', true); return; }
+      const first = cyclesSorted()[0]?.id;
+      let split = 0;
+      // Added day by day, so each "sent back" can only use payouts not already used by an earlier one.
+      for (const s of ss) {
+        const what = `needed for ${[...s.orders.map(n => '#' + n), ...s.partial.map(n => 'part of #' + n)].join(', ')}`;
+        const base = { cycleId: cycleIdForDate(s.date) || first, date: s.date, orders: s.orders };
+        const backBtc = form.elements[`as-${s.date}`]?.value === 'recycled' ? Math.max(0, Math.min(s.btc, walletAvail(s.date))) : 0;
+        if (backBtc > 0) {
+          const whole = backBtc >= s.btc - 1e-8;
+          data.deposits.push({ id: uid(), ...base, btc: +backBtc.toFixed(8), usd: whole ? s.usd : null, kind: 'recycled', note: `From the reports: withdrawn BTC sent back, ${what}` });
+          if (!whole) split++;
+        }
+        const rest = +(s.btc - backBtc).toFixed(8);
+        if (rest > 1e-8) data.deposits.push({ id: uid(), ...base, btc: rest, usd: backBtc > 0 ? null : s.usd, kind: 'new', note: `From the reports: new money, ${what}` });
+      }
+      toast(`${plural(ss.length, 'day')} added${split ? `. ${plural(split, 'day')} needed more than your payouts had brought to your wallet, so the rest was added as new money.` : ''}`);
+    } else if (form.dataset.form === 'deposit-admin') {
+      const nums = [...form.querySelectorAll('input[name="order"]:checked')].map(i => +i.value);
+      const ps = data.purchases.filter(p => nums.includes(p.num));
+      if (!ps.length) { toast('Tick the contracts you paid for first.', true); return; }
+      const usd = sum(ps, p => (p.paidUsd > 0 ? p.paidUsd : 0));
+      data.deposits.push({
+        id: uid(), cycleId: f.cycleId, date: ps.map(p => p.date).sort()[0], btc: +sum(ps, contractValue).toFixed(8),
+        usd: ps.every(p => p.paidUsd > 0) ? +usd.toFixed(2) : null, kind: f.kind === 'recycled' ? 'recycled' : 'new', outside: true, orders: nums,
+        note: `Paid outside the platform for contract${nums.length > 1 ? 's' : ''} #${nums.join(', #')} (added by the admin)${f.kind === 'recycled' ? ', with BTC withdrawn earlier' : ''}`,
+      });
     } else if (form.dataset.form === 'deposit-orders') {
       const nums = [...form.querySelectorAll('input[name="order"]:checked')].map(i => +i.value);
       const ps = data.purchases.filter(p => nums.includes(p.num));

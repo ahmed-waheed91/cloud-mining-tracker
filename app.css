@@ -177,6 +177,11 @@ h2:first-child { margin-top: 4px; }
 .pos { color: var(--pos); }
 .neg { color: var(--neg); }
 .warn { color: var(--warn); }
+.tag {
+  display: inline-block; font-size: 11px; line-height: 1.5; padding: 0 7px; border-radius: 999px; margin-left: 4px;
+  border: 1px solid var(--border); color: var(--muted); white-space: nowrap; cursor: help;
+}
+.tag.warn { border-color: var(--warn); color: var(--warn); }
 .help {
   display: inline-flex; width: 15px; height: 15px; border-radius: 50%; border: 1px solid var(--muted);
   font-size: 10px; align-items: center; justify-content: center; cursor: help; color: var(--muted);
