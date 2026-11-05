@@ -230,3 +230,67 @@ tr.current td { background: var(--panel-2); }
   padding: 8px 10px; font-size: 12.5px; line-height: 1.45; white-space: normal; text-align: left; font-weight: 400;
   box-shadow: 0 6px 20px rgba(0, 0, 0, .25); pointer-events: none;
 }
+
+/* ---------- Overview (v1.6.0): one main card, a running line, quiet notices ---------- */
+.banner.quiet { border-color: var(--border); color: var(--muted); padding: 6px 12px; font-size: 13px; gap: 10px; }
+.banner.quiet button { padding: 3px 10px; font-size: 12.5px; }
+button.link.quiet { color: var(--muted); font-size: 12.5px; }
+.notices { display: flex; flex-direction: column; gap: 8px; margin: 0 0 20px; }
+.notices .alert { padding: 7px 12px; font-size: 13.5px; }
+.note-line { display: flex; gap: 8px 12px; align-items: baseline; flex-wrap: wrap; color: var(--muted); font-size: 13px; padding: 0 2px; }
+.note-line .link { font-size: 12.5px; }
+.note-line > button.link { color: var(--muted); }
+.import-line details { flex: 1; min-width: 0; }
+.import-line summary { cursor: pointer; list-style: none; display: flex; gap: 12px; flex-wrap: wrap; }
+.import-line summary::-webkit-details-marker { display: none; }
+.import-line details[open] { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 10px 14px; color: var(--text); }
+.import-line details[open] summary .link { display: none; }
+
+.hero { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 22px 24px; }
+.hero .label { color: var(--muted); font-size: 12.5px; display: flex; gap: 6px; align-items: center; }
+.hero .usd { color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+.hero-top { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 20px 32px; align-items: start; }
+.hero .big { font-size: 34px; font-weight: 700; line-height: 1.15; margin: 4px 0 2px; font-variant-numeric: tabular-nums; letter-spacing: -0.01em; }
+.hero .big small, .running .big small { font-size: 15px; font-weight: 600; color: var(--muted); }
+.hero .back-pct { font-size: 20px; font-weight: 650; margin-top: 4px; }
+.hero .progress { height: 8px; margin: 8px 0 8px; }
+.hero .back .hint { margin: 0; font-size: 12.5px; }
+.hero-stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px 24px; margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--border); }
+.mini .v { font-size: 16px; font-weight: 600; margin-top: 3px; font-variant-numeric: tabular-nums; }
+.mini .v small { color: var(--muted); font-weight: 500; font-size: 12px; }
+.mini .usd { font-size: 12.5px; }
+
+.running-head { display: flex; align-items: center; gap: 12px; justify-content: space-between; margin: 28px 0 8px; }
+.running-head h2 { margin: 0; }
+.running-line { font-size: 14.5px; line-height: 1.9; font-variant-numeric: tabular-nums; }
+.running-line .big { font-size: 24px; font-weight: 700; }
+.running-line .dot { color: var(--border); margin: 0 6px; font-weight: 700; }
+.muted { color: var(--muted); }
+.seg.small button { padding: 3px 10px; font-size: 12.5px; }
+
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; }
+.stats .card { background: var(--panel); border-color: transparent; padding: 12px 14px; }
+.stats .card .value { font-size: 16.5px; }
+.stats .card .usd, .stats .card .sub { font-size: 12.5px; }
+.stats .card .sub { margin-top: 3px; }
+
+details.more { margin-top: 28px; border-top: 1px solid var(--border); }
+details.more > summary { cursor: pointer; font-weight: 600; font-size: 15px; padding: 14px 0 4px; display: flex; align-items: baseline; gap: 10px; }
+details.more > summary .hint { margin: 0; font-weight: 400; }
+details.more h3 { font-size: 14px; margin: 18px 0 8px; }
+
+.ov-chart { padding: 14px 16px; }
+.ov-chart .chart-tabs { margin-bottom: 12px; }
+.ov-chart .chart-tabs button { font-size: 12.5px; padding: 4px 12px; }
+.ov-chart .canvas { height: 320px; }
+.cols.ov { margin-top: 0; }
+@media (max-width: 1399px) { .cols.ov > .right { margin-top: 28px; } }
+@media (min-width: 1400px) and (min-height: 1000px) { .ov-chart .canvas { height: 380px; } }
+
+@media (max-width: 760px) {
+  .hero { padding: 18px; }
+  .hero-top { grid-template-columns: 1fr; }
+  .hero .big { font-size: 28px; }
+  .hero-stats { grid-template-columns: 1fr; gap: 12px; }
+  .running-head { flex-wrap: wrap; }
+}

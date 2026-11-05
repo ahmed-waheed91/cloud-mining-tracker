@@ -4,7 +4,7 @@
 // Data lives in a folder the user picks (File System Access API, Chrome): cloud-mining.json
 // plus daily backups. It is mirrored to localStorage so nothing is lost while disconnected.
 
-const APP_VERSION = '1.5.1';
+const APP_VERSION = '1.6.0';
 const DATA_VERSION = 2;
 const STORAGE_KEY = 'cloud-mining-data';
 const PREFS_KEY = 'cloud-mining-prefs';
@@ -610,10 +610,14 @@ function renderBanner() {
       <button data-act="open-folder">Choose a different folder</button>`;
   } else if (fileState === 'unsupported') {
     b.innerHTML = `This browser can't save to a folder, so data is kept in this browser only. Open the app in <b>Chrome</b> or <b>Edge</b>, or use <b>Export backup</b> in Settings regularly.`;
+  } else if (prefs.bannerHidden === todayIso()) {
+    b.hidden = true;
   } else {
-    b.innerHTML = `Not connected to a data folder — changes are only kept in this browser.
-      <button class="primary" data-act="open-folder">Choose data folder</button>`;
+    b.innerHTML = `<span>Not connected to a data folder — changes are only kept in this browser.</span>
+      <button data-act="open-folder">Choose data folder</button>
+      <button class="link quiet" data-act="hide-banner">Hide for today</button>`;
   }
+  b.classList.toggle('quiet', fileState === 'none');
 }
 
 function renderWelcome() {
@@ -652,20 +656,6 @@ function renderWelcome() {
   </div>`;
 }
 
-function renderHeadline(m) {
-  if (!m.in && !m.profit) return '';
-  const parts = [];
-  if (m.in) {
-    parts.push(`You've put in <b>${fmtAmtU(m.in)}</b>, taken <b>${fmtAmtU(m.withdrawn)}</b> back to your wallet${m.carriedOut ? ` and carried <b>${fmtAmtU(m.carriedOut)}</b> to the next cycle` : ''}, and <b>${fmtAmtU(m.onPlatform)}</b> is still on the platform.`);
-    parts.push(`Overall you're <b class="${tone(m.net)}">${m.net >= 0 ? 'up' : 'down'} ${fmtAmtU(Math.abs(m.net))} (${fmtPct(m.retOnIn, 1, true)})</b>${fiat(m.net) ? ` ≈ ${fiat(Math.abs(m.net))}` : ''}.`);
-  } else {
-    parts.push(`Profit so far: <b class="${tone(m.profit)}">${fmtAmtU(m.profit, true)}</b>.`);
-  }
-  const w = m.windows.d30;
-  if (isFinite(w.per30)) parts.push(`Profit is running at <b>${fmtPct(w.per30, 2)} per 30 days</b> on the capital working (last ${plural(w.n, 'day')}).`);
-  return `<p class="headline">${parts.join(' ')}</p>`;
-}
-
 function renderImportPanel() {
   const li = data.lastImport;
   if (!li) return '';
@@ -678,9 +668,11 @@ function renderImportPanel() {
       <td class="n ${signed ? tone(y - x) : ''}">${changed && typeof x === 'number' && typeof y === 'number' && isFinite(y - x) && fmt !== fmtDate ? (signed ? fmtDelta(y - x, fmt) : '') : ''}</td></tr>`;
   };
   const fmtDelta = (d, fmt) => (fmt === fmtPctPlain ? (d > 0 ? '+' : '−') + Math.abs(d * 100).toFixed(2) + ' pts' : fmt === String ? (d > 0 ? '+' : '') + d : fmtAmt(d, true));
-  return `<div class="panel import-panel">
-    <div class="panel-head"><b>Last import</b> <span class="hint" style="margin:0">${new Date(li.at).toLocaleString('en-GB', { dateStyle: 'medium', timeStyle: 'short' })} · view: ${esc(li.scopeName)}</span>
-      <button class="link" data-act="dismiss-import">Dismiss</button></div>
+  const bad = li.files.filter(f => !f.ok && !f.skipped).length;
+  return `<div class="note-line import-line">
+    <details>
+    <summary><span>⇩ <b>Last import</b> ${new Date(li.at).toLocaleString('en-GB', { dateStyle: 'medium', timeStyle: 'short' })} · ${plural(li.files.length, 'file')}${bad ? ` · <span class="neg">${bad} not imported</span>` : ''}</span> <span class="link">What changed</span></summary>
+    <p class="hint" style="margin:8px 0 0">View: ${esc(li.scopeName)}</p>
     <ul class="filelist">${li.files.map(f => `<li class="${f.ok ? '' : f.skipped ? 'muted' : 'neg'}">${esc(f.file)} — ${esc(f.msg)}</li>`).join('')}</ul>
     <table class="compact"><tbody>
       ${row('Data up to', b.last, a.last, fmtDate)}
@@ -693,15 +685,11 @@ function renderImportPanel() {
       ${row(`Net result (${unitLabel()})`, b.net, a.net, v => fmtAmt(v, true), true)}
       ${row('Return per 30 days (last 30 days)', b.per30, a.per30, fmtPctPlain, true)}
     </tbody></table>
+    </details>
+    <button class="link" data-act="dismiss-import">Dismiss</button>
   </div>`;
 }
 function fmtPctPlain(v) { return fmtPct(v, 2); }
-
-function renderWarnings(R) {
-  const ws = warnings(R);
-  if (!ws.length) return '';
-  return `<div class="warnings">${ws.map(w => `<div class="alert ${w.level}">${w.level === 'warn' ? '⚠' : 'ℹ'} <span>${w.text}</span></div>`).join('')}</div>`;
-}
 
 function renderOverview(R) {
   const { m, days } = R;
@@ -709,78 +697,138 @@ function renderOverview(R) {
   if (isNew) return renderWelcome();
   if (!days.length && !m.in) {
     const why = missingDataHints(R);
-    return `${renderWarnings(R)}<div class="empty">No data in this view yet.<br><br>
+    return `${renderNotices(R)}<div class="empty">No data in this view yet.<br><br>
       ${why.length ? why.join('<br><br>') : 'Click <b>Import reports</b> (or drag the CSV files onto this page), and add your deposit on the <b>Money in &amp; out</b> tab.'}</div>`;
   }
   const w = m.windows;
   const retRow = (label, key, dp, helpText) => `<tr><td>${label} ${help(helpText)}</td>
     ${['d7', 'd30', 'all'].map(k => `<td class="n ${tone(w[k][key])}">${fmtPct(w[k][key], dp, true)}</td>`).join('')}</tr>`;
-  const recoveredPct = m.in > 0 ? Math.min(1, Math.max(0, m.recovered / m.in)) : 0;
   const checks = data.balanceChecks.filter(c => currentScope === 'all' || cycleIdForDate(c.date) === currentScope).sort(byDate);
   const lastCheck = checks.at(-1);
   const checkDiff = lastCheck ? lastCheck.btc - balanceAt(currentScope, lastCheck.date) : NaN;
   const cyc = R.cycle;
   const u = unitLabel();
+  const chart = OV_CHARTS[prefs.ovChart] ? prefs.ovChart : 'daily';
 
   return `
-  ${renderHeadline(m)}
-  <div class="cols top-panels">${renderImportPanel() ? `<div>${renderImportPanel()}</div>` : ''}${renderWarnings(R) ? `<div>${renderWarnings(R)}</div>` : ''}</div>
-
-  <h2>Where your money is</h2>
-  <div class="grid">
-    ${card('Money in', m.in, { help: 'BTC you sent to the platform for this cycle (including any balance carried over from the previous cycle).', sub: m.in ? '' : '<span class="warn">No deposit recorded — add it on the Money in &amp; out tab.</span>' })}
-    ${card('Withdrawn to your wallet', m.withdrawn, { help: 'Payouts sent to your own wallet.' + (m.carriedOut ? ' Carried over to the next cycle is shown below.' : ''), sub: m.carriedOut ? `+ ${fmtAmtU(m.carriedOut)} carried to next cycle` : plural(R.W.length, 'payout') })}
-    ${card('Still on the platform', m.onPlatform, { help: 'Your BTC that is still exposed to the platform: the available balance plus capital inside contracts that has not come back yet.', sub: `${fmtAmt(m.balance)} balance · ${fmtAmt(m.outstanding)} in contracts` })}
-    ${card('Net result', m.net, { sign: true, tone: tone(m.net), help: 'Withdrawn + still on the platform − money in. This is your real profit or loss after loss days.', sub: `${fmtPct(m.retOnIn, 2, true)} of money in` })}
-  </div>
-
-  <div class="cols charts-right"><div class="left">
-  <h2>Returns (in BTC)</h2>
-  <p class="hint">Measured on the capital working in contracts — USD/AED price moves don't affect these.</p>
-  <div class="table-wrap"><table>
-    <thead><tr><th></th><th class="n">Last 7 days</th><th class="n">Last 30 days</th><th class="n">Whole ${currentScope === 'all' ? 'history' : 'cycle'}</th></tr></thead>
-    <tbody>
-      ${retRow('Return per day', 'daily', 3, 'Profit ÷ capital working, per day.')}
-      ${retRow('Return per 30 days', 'per30', 2, 'What one 30-day contract earns on its price at this rate.')}
-      ${retRow('Return per year (simple)', 'annual', 1, 'Daily return × 365, not compounded. You withdraw profit, so it does not compound.')}
-      <tr><td>Profit (${u})</td>${['d7', 'd30', 'all'].map(k => `<td class="n ${tone(w[k].profit)}">${fmtAmt(w[k].profit, true)}<br><small class="usd">${fiat(w[k].profit)}</small></td>`).join('')}</tr>
-      <tr><td>Loss days</td>${['d7', 'd30', 'all'].map(k => `<td class="n ${w[k].lossDays ? 'neg' : ''}">${w[k].lossDays} of ${w[k].n}</td>`).join('')}</tr>
-    </tbody>
-  </table></div>
-  <p class="hint" style="margin-top:8px">On money in: ${fmtPct(m.retOnIn, 2, true)} over ${plural(m.daysElapsed, 'day')} · ${fmtPct(m.retOnInPerDay, 3, true)} per day · ${fmtPct(m.retOnInPerDay * 30, 2, true)} per 30 days.</p>
-
-  <h2>Getting your money back</h2>
-  <div class="panel">
-    <div>${fmtAmtU(m.recovered)} of ${fmtAmtU(m.in)} back in your wallet${m.carriedOut ? ' (incl. carried over)' : ''} — <b>${fmtPct(recoveredPct, 1)}</b></div>
-    <div class="progress"><div style="width:${(recoveredPct * 100).toFixed(1)}%"></div></div>
-    <div class="hint" style="margin:0">${m.remaining <= 0 ? 'All money in is back — everything from here is profit.'
-      : m.daysToRecover ? `At the last 30 days' profit (${fmtAmtU(m.rate)}/day), the rest takes about <b>${m.daysToRecover} days</b> → around <b>${fmtDate(addDays(m.last || todayIso(), m.daysToRecover))}</b>. Assumes capital keeps being reinvested and profit is withdrawn. See <b>Projection</b> for other scenarios.`
-      : 'Not enough profit history yet to project.'}</div>
-  </div>
-
-  <h2>Profit breakdown</h2>
-  <div class="grid">
-    ${card('Total profit', m.profit, { sign: true, tone: tone(m.profit), help: 'Σ Profit from the daily report (Total − Cost). Includes loss days.', sub: `on ${fmtAmt(m.capBack)} capital returned` })}
-    ${card('From the bonus', m.bonus, { help: 'The platform adds a bonus on top of what the hashrate mines.', sub: m.profit ? `${fmtPct(m.bonus / m.profit, 0)} of total profit` : '' })}
-    ${card('From mining itself', m.mining, { sign: true, tone: tone(m.mining), help: 'Profit without the bonus. Near zero means the mining only covers the contract price.' })}
-    ${card('Loss days', m.lossBtc, { sign: true, tone: m.lossBtc < 0 ? 'neg' : '', help: 'Days where the payout was less than the capital due back. The shortfall is lost capital.', sub: plural(m.lossDays, 'day') })}  </div>
+  ${renderNotices(R)}
+  <div class="cols charts-right ov"><div class="left">
+  ${renderHero(R)}
+  ${renderRunning(R)}
 
   <h2>Right now</h2>
-  <div class="grid">
+  <div class="stats">
     ${card('Capital working', m.working, { help: 'Price of all contracts active today.', sub: `${plural(m.activeCount, 'active contract')} · ${m.activeTh.toLocaleString('en-US')} TH/s` })}
-    ${card('Available balance (calculated)', m.balance, { help: 'Money in − paid for contracts + received − withdrawn. Returned capital and profit waiting for the next reinvest block or payout.', sub: cyc?.reinvestFrom && cyc.reinvestFrom !== 'off' ? `Reinvests ${REINVEST_FROM[cyc.reinvestFrom].toLowerCase()} in ${(cyc.blockTh || MIN_BLOCK_TH).toLocaleString('en-US')} TH/s blocks${cyc.payoutFrom && cyc.payoutFrom !== 'off' ? ` · pays out ${PAYOUT_FROM[cyc.payoutFrom].toLowerCase()} at ${fmtAmt(cyc.withdrawThreshold || MIN_PAYOUT)}` : ''}` : '' })}
+    ${card('Available balance', m.balance, { help: 'Calculated: money in − paid for contracts + received − withdrawn. Returned capital and profit waiting for the next reinvest block or payout.', sub: cyc?.reinvestFrom && cyc.reinvestFrom !== 'off' ? `Reinvests ${REINVEST_FROM[cyc.reinvestFrom].toLowerCase()} in ${(cyc.blockTh || MIN_BLOCK_TH).toLocaleString('en-US')} TH/s blocks${cyc.payoutFrom && cyc.payoutFrom !== 'off' ? ` · pays out ${PAYOUT_FROM[cyc.payoutFrom].toLowerCase()} at ${fmtAmt(cyc.withdrawThreshold || MIN_PAYOUT)}` : ''}` : '' })}
     ${lastCheck ? card('Balance check', checkDiff, { sign: true, tone: Math.abs(checkDiff) < 1e-6 ? 'pos' : 'warn', help: 'Your dashboard balance minus the calculated balance on that date. Small differences usually mean a payout that is not in the imported reports yet.', sub: `Dashboard ${fmtAmt(lastCheck.btc)} on ${fmtDate(lastCheck.date)}`, fiat: false }) : ''}
     ${card('Data up to', 0, { text: fmtDate(m.last), sub: plural(days.length, 'day') + ' of earnings' })}
   </div>
+
+  <details class="more" data-fold="ovDetails" ${prefs.ovDetails ? 'open' : ''}>
+    <summary>More details <span class="hint">returns table, profit breakdown, money in</span></summary>
+    <h3>Returns (in BTC)</h3>
+    <p class="hint">Measured on the capital working in contracts — USD/AED price moves don't affect these.</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th></th><th class="n">Last 7 days</th><th class="n">Last 30 days</th><th class="n">Whole ${currentScope === 'all' ? 'history' : 'cycle'}</th></tr></thead>
+      <tbody>
+        ${retRow('Return per day', 'daily', 3, 'Profit ÷ capital working, per day.')}
+        ${retRow('Return per 30 days', 'per30', 2, 'What one 30-day contract earns on its price at this rate.')}
+        ${retRow('Return per year (simple)', 'annual', 1, 'Daily return × 365, not compounded. You withdraw profit, so it does not compound.')}
+        <tr><td>Profit (${u})</td>${['d7', 'd30', 'all'].map(k => `<td class="n ${tone(w[k].profit)}">${fmtAmt(w[k].profit, true)}<br><small class="usd">${fiat(w[k].profit)}</small></td>`).join('')}</tr>
+        <tr><td>Loss days</td>${['d7', 'd30', 'all'].map(k => `<td class="n ${w[k].lossDays ? 'neg' : ''}">${w[k].lossDays} of ${w[k].n}</td>`).join('')}</tr>
+      </tbody>
+    </table></div>
+    <p class="hint" style="margin-top:8px">On money in: ${fmtPct(m.retOnIn, 2, true)} over ${plural(m.daysElapsed, 'day')} · ${fmtPct(m.retOnInPerDay, 3, true)} per day · ${fmtPct(m.retOnInPerDay * 30, 2, true)} per 30 days.</p>
+
+    <h3>Profit breakdown</h3>
+    <div class="stats">
+      ${card('Total profit', m.profit, { sign: true, tone: tone(m.profit), help: 'Σ Profit from the daily report (Total − Cost). Includes loss days.', sub: `on ${fmtAmt(m.capBack)} capital returned` })}
+      ${card('From the bonus', m.bonus, { help: 'The platform adds a bonus on top of what the hashrate mines.', sub: m.profit ? `${fmtPct(m.bonus / m.profit, 0)} of total profit` : '' })}
+      ${card('From mining itself', m.mining, { sign: true, tone: tone(m.mining), help: 'Profit without the bonus. Near zero means the mining only covers the contract price.' })}
+      ${card('Loss days', m.lossBtc, { sign: true, tone: m.lossBtc < 0 ? 'neg' : '', help: 'Days where the payout was less than the capital due back. The shortfall is lost capital.', sub: plural(m.lossDays, 'day') })}
+    </div>
+  </details>
   </div><div class="right">
 
-  <h2>Charts</h2>
-  <div class="charts">
-    <div class="chart-box"><h3>Daily profit (${u}) and return per day</h3><div class="canvas"><canvas id="chDaily"></canvas></div></div>
-    <div class="chart-box"><h3>Capital working in contracts (${u})</h3><div class="canvas"><canvas id="chCapital"></canvas></div></div>
-    <div class="chart-box"><h3>Running totals (${u})</h3><div class="canvas"><canvas id="chCumul"></canvas></div></div>
+  <div class="chart-box ov-chart">
+    <div class="chart-tabs seg">${Object.entries(OV_CHARTS).map(([k, c]) => `<button data-act="ov-chart" data-v="${k}" class="${k === chart ? 'on' : ''}">${c.label}</button>`).join('')}</div>
+    <h3>${OV_CHARTS[chart].title(u)}</h3>
+    <div class="canvas"><canvas id="chOverview"></canvas></div>
   </div>
   </div></div>`;
+}
+
+const OV_CHARTS = {
+  daily: { label: 'Daily profit', title: u => `Daily profit (${u}) and return per day` },
+  capital: { label: 'Capital working', title: u => `Capital working in contracts (${u})` },
+  cumul: { label: 'Running totals', title: u => `Profit and withdrawn so far (${u})` },
+};
+
+// The one card at the top: net result, how much of the money in is back, and where the money is.
+function renderHero(R) {
+  const { m } = R;
+  const pct = m.in > 0 ? Math.min(1, Math.max(0, m.recovered / m.in)) : 0;
+  const mini = (label, btc, helpText, sub = '') => `<div class="mini">
+    <div class="label">${label} ${help(helpText)}</div>
+    <div class="v">${fmtAmt(btc)} <small>${unitLabel()}</small></div>
+    <div class="usd">${fiat(btc) ? '≈ ' + fiat(btc) : ''}${sub ? ` · ${sub}` : ''}</div></div>`;
+  const backText = !m.in ? ''
+    : m.remaining <= 0 ? 'All money in is back — everything from here is profit.'
+    : !m.activeCount ? `No contracts are running right now, so nothing more is coming back until new ones start. ${fmtAmtU(m.onPlatform)} is still on the platform.`
+    : m.daysToRecover ? `The rest takes about <b>${m.daysToRecover} days</b> at the last 30 days' profit → around <b>${fmtDate(addDays(m.last || todayIso(), m.daysToRecover))}</b>. ${help(`At ${fmtAmtU(m.rate)} profit per day, with capital reinvested and profit withdrawn. See Projection for other scenarios.`)}`
+    : 'Not enough profit history yet to say when the rest is back.';
+  return `<section class="hero">
+    <div class="hero-top">
+      <div>
+        <div class="label">${m.in ? 'Net result' : 'Profit so far'} ${help(m.in ? 'Withdrawn + still on the platform − money in. This is your real profit or loss after loss days.' : 'No deposit is recorded yet, so this is the profit from the daily report only.')}</div>
+        <div class="big ${tone(m.in ? m.net : m.profit)}">${fmtAmt(m.in ? m.net : m.profit, true)} <small>${unitLabel()}</small></div>
+        <div class="usd">${fiat(m.in ? m.net : m.profit) ? '≈ ' + fiat(m.in ? m.net : m.profit) : ''}${m.in ? ` · ${fmtPct(m.retOnIn, 2, true)} of money in` : ''}</div>
+      </div>
+      ${m.in ? `<div class="back">
+        <div class="label">Money back in your wallet</div>
+        <div class="back-pct">${fmtPct(pct, 1)}</div>
+        <div class="progress"><div style="width:${(pct * 100).toFixed(1)}%"></div></div>
+        <div class="hint">${fmtAmtU(m.recovered)} of ${fmtAmtU(m.in)}${m.carriedOut ? ' (incl. carried over)' : ''}. ${backText}</div>
+      </div>` : ''}
+    </div>
+    <div class="hero-stats">
+      ${m.in ? mini('Money in', m.in, 'BTC you sent to the platform for this cycle (including any balance carried over from the previous cycle).')
+        : `<div class="mini"><div class="label">Money in</div><div class="v warn">none yet</div><div class="usd">Add it on the Money in &amp; out tab.</div></div>`}
+      ${mini('Withdrawn to your wallet', m.withdrawn, 'Payouts sent to your own wallet.', m.carriedOut ? `+ ${fmtAmt(m.carriedOut)} carried on` : plural(R.W.length, 'payout'))}
+      ${mini('Still on the platform', m.onPlatform, `Your BTC that is still exposed to the platform: ${fmtAmtU(m.balance)} available balance plus ${fmtAmtU(m.outstanding)} of capital inside contracts that has not come back yet.`)}
+    </div>
+  </section>`;
+}
+
+// One line on how the contracts are doing, for the window picked with the 7d / 30d / all switch.
+function renderRunning(R) {
+  const key = ['d7', 'd30', 'all'].includes(prefs.runWin) ? prefs.runWin : 'd30';
+  const x = R.m.windows[key];
+  if (!x || !x.n) return '';
+  const names = { d7: '7 days', d30: '30 days', all: currentScope === 'all' ? 'All' : 'Cycle' };
+  return `<section class="running">
+    <div class="running-head"><h2>How it's running</h2>
+      <div class="seg small">${Object.entries(names).map(([k, l]) => `<button data-act="run-win" data-v="${k}" class="${k === key ? 'on' : ''}">${l}</button>`).join('')}</div></div>
+    <div class="running-line">
+      <span class="big ${tone(x.per30)}">${fmtPct(x.per30, 2)}</span> <span class="muted">per 30 days</span> ${help('What one 30-day contract earns on its price at this rate, measured on the capital working.')}
+      <span class="dot">·</span> <span class="${tone(x.daily)}">${fmtPct(x.daily, 3, true)}</span> <span class="muted">per day</span>
+      <span class="dot">·</span> <span class="${tone(x.profit)}">${fmtAmt(x.profit, true)} ${unitLabel()}</span> <span class="muted">profit${fiat(x.profit) ? ` (${fiat(x.profit)})` : ''}</span>
+      <span class="dot">·</span> <span class="${x.lossDays ? 'neg' : ''}">${plural(x.lossDays, 'loss day')}</span> <span class="muted">of ${x.n}</span>
+    </div>
+  </section>`;
+}
+
+// Warnings that need action stay as they are; info notes and the last-import summary shrink to one line each.
+function renderNotices(R) {
+  const ws = warnings(R);
+  const warn = ws.filter(w => w.level === 'warn');
+  const info = prefs.notesHidden === todayIso() ? [] : ws.filter(w => w.level !== 'warn');
+  const out = [];
+  if (warn.length) out.push(`<div class="warnings">${warn.map(w => `<div class="alert warn">⚠ <span>${w.text}</span></div>`).join('')}</div>`);
+  if (info.length) out.push(`<div class="note-line">ℹ <span>${info.map(w => w.text).join(' · ')}</span> <button class="link" data-act="hide-notes">Hide for today</button></div>`);
+  const imp = renderImportPanel();
+  if (imp) out.push(imp);
+  return out.length ? `<div class="notices">${out.join('')}</div>` : '';
 }
 
 // ---------- charts ----------
@@ -800,11 +848,13 @@ function chartTheme() {
 const dayLabel = d => new Date(d + 'T00:00:00').toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
 
 function drawOverviewCharts(R) {
-  if (typeof Chart === 'undefined' || !R.days.length) return;
+  const el = $("#chOverview");
+  if (typeof Chart === "undefined" || !R.days.length || !el) return;
+  const which = OV_CHARTS[prefs.ovChart] ? prefs.ovChart : "daily";
   const { v, base, yAxis } = chartTheme();
   const k = unitScale();
   const days = R.days;
-  charts.daily = new Chart($('#chDaily'), {
+  if (which === 'daily') charts.daily = new Chart(el, {
     data: {
       labels: days.map(d => dayLabel(d.date)),
       datasets: [
@@ -818,7 +868,7 @@ function drawOverviewCharts(R) {
   const first = days[0].date, last = days.at(-1).date;
   const span = [];
   for (let d = first; d <= last; d = addDays(d, 1)) span.push(d);
-  charts.capital = new Chart($('#chCapital'), {
+  if (which === 'capital') charts.capital = new Chart(el, {
     type: 'line',
     data: {
       labels: span.map(dayLabel),
@@ -833,7 +883,7 @@ function drawOverviewCharts(R) {
     cw += sum(R.W.filter(p => p.requested === d), 'btc');
     return { p: cp * k, w: cw * k };
   });
-  charts.cumul = new Chart($('#chCumul'), {
+  if (which === 'cumul') charts.cumul = new Chart(el, {
     type: 'line',
     data: {
       labels: span.map(dayLabel),
@@ -1705,6 +1755,13 @@ function toast(msg, err = false) {
 }
 
 function bind() {
+  // Remember open/closed <details data-fold="…"> sections per browser, like the other display prefs.
+  document.addEventListener('toggle', e => {
+    const f = e.target.dataset?.fold;
+    if (!f) return;
+    prefs[f] = e.target.open;
+    try { localStorage.setItem(PREFS_KEY, JSON.stringify(prefs)); } catch { /* ignore */ }
+  }, true);
   $('#tabs').addEventListener('click', e => {
     const t = e.target.closest('button[data-tab]');
     if (t) { currentTab = t.dataset.tab; editing = null; render(); }
@@ -1749,6 +1806,10 @@ function bind() {
     else if (act === 'import') $('#importInput').click();
     else if (act === 'import-backup') $('#backupInput').click();
     else if (act === 'dismiss-import') { data.lastImport = null; save(); render(); }
+    else if (act === 'ov-chart') setPref('ovChart', b.dataset.v);
+    else if (act === 'run-win') setPref('runWin', b.dataset.v);
+    else if (act === 'hide-notes') setPref('notesHidden', todayIso());
+    else if (act === 'hide-banner') setPref('bannerHidden', todayIso());
     else if (act === 'toggle-month') { const ym = b.dataset.ym; collapsedMonths.has(ym) ? collapsedMonths.delete(ym) : collapsedMonths.add(ym); render(); }
     else if (act === 'proj-reset') { resetProj(); render(); }
     else if (act === 'edit') { editing = { type: b.dataset.type, id }; render(); }

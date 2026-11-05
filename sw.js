@@ -1,5 +1,5 @@
 // Offline support. Network first so updates show up on the next open; the cache is the fallback.
-const CACHE = 'cloud-mining-1.5.1';
+const CACHE = 'cloud-mining-1.6.0';
 const ASSETS = ['./', 'index.html', 'app.css', 'app.js', 'vendor/chart.umd.min.js', 'manifest.webmanifest', 'icons/icon.svg', 'icons/icon-192.png', 'icons/icon-512.png'];
 
 self.addEventListener('install', e => {
