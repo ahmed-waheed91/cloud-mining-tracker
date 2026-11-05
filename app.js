@@ -4,7 +4,7 @@
 // Data lives in a folder the user picks (File System Access API, Chrome): cloud-mining.json
 // plus daily backups. It is mirrored to localStorage so nothing is lost while disconnected.
 
-const APP_VERSION = '1.8.1';
+const APP_VERSION = '1.9.0';
 const DATA_VERSION = 3; // 3: deposits may have outside: true (paid straight for admin-added contracts)
 const STORAGE_KEY = 'cloud-mining-data';
 const PREFS_KEY = 'cloud-mining-prefs';
@@ -46,6 +46,7 @@ function emptyData() {
   return {
     version: DATA_VERSION, savedAt: null,
     cycles: [],        // {id, name, start, notes, reinvestFrom, blockTh, blockPrice, blockPriceDate, payoutFrom, withdrawThreshold (payout amount); old reinvestThreshold is no longer used}
+    // purchases may carry leaveOut: true (a contract that was not mining and was not paid for)
     deposits: [],      // {id, cycleId, date, btc, usd, kind: 'new'|'recycled' (withdrawn BTC sent back)|'carry', outside, orders, note}
     balanceChecks: [], // {id, date, btc, note}
     purchases: [],     // from hashrate-purchases report, one per order #
@@ -343,10 +344,16 @@ function compute(scope) {
   }
   const days = [...byDay.values()].sort(byDate);
   const I = insights();
+  // A contract that wasn't mining and that the user says wasn't paid for ("leave it out" switch):
+  // the "Cost" the report charged for it on every one of its days was really profit of the others.
+  const leftOut = I.idle.filter(x => x.p.leaveOut);
   for (const d of days) {
+    d.cost0 = d.cost; d.profit0 = d.profit; // as the platform reports them
+    d.excluded = sum(leftOut.filter(x => x.p.start <= d.date && d.date <= x.p.end), 'perDay');
+    if (d.excluded) { d.cost -= d.excluded; d.profit += d.excluded; }
     d.ret = d.cost > 0 ? d.profit / (d.cost * CONTRACT_DAYS) : NaN;
-    // Capital the report took back for a contract that wasn't mining that day.
-    d.idle = I.idleByDay.get(d.date) || 0;
+    // Capital the report took back for a contract that wasn't mining that day (and isn't left out).
+    d.idle = sum(I.idle.filter(x => !x.p.leaveOut && x.dates.has(d.date)), 'perDay');
   }
 
   const m = {};
@@ -363,7 +370,8 @@ function compute(scope) {
   m.admin = P.filter(isAdminAdded);
   m.adminValue = sum(m.admin, contractValue);
   m.alloc = m.paid + m.adminValue;
-  m.idle = I.idle.filter(x => days.some(d => x.dates.has(d.date)));
+  m.idle = I.idle.filter(x => !x.p.leaveOut && days.some(d => x.dates.has(d.date)));
+  m.leftOut = leftOut.filter(x => days.some(d => d.excluded && x.p.start <= d.date && d.date <= x.p.end));
   m.received = sum(days, 'total');
   m.capBack = sum(days, 'cost');
   m.profit = sum(days, 'profit');
@@ -406,8 +414,13 @@ function compute(scope) {
 function winStats(ds) {
   const cost = sum(ds, 'cost'), profit = sum(ds, 'profit');
   const idle = sum(ds, d => d.idle || 0);
+  const excluded = sum(ds, d => d.excluded || 0);
+  const cost0 = sum(ds, d => d.cost0 ?? d.cost), profit0 = sum(ds, d => d.profit0 ?? d.profit);
   return {
-    n: ds.length, profit, cost, idle,
+    n: ds.length, profit, cost, idle, excluded,
+    // what the platform's report says, when a contract is left out
+    platformPer30: excluded > 0 && cost0 > 0 ? profit0 / cost0 : NaN,
+    platformLossDays: ds.filter(d => (d.profit0 ?? d.profit) < 0).length,
     // the same, leaving out capital taken back for contracts that weren't mining
     adjPer30: idle > 0 && cost - idle > 0 ? (profit + idle) / (cost - idle) : NaN,
     adjLossDays: ds.filter(d => d.profit + (d.idle || 0) < 0).length,
@@ -542,11 +555,14 @@ function suggestedDeposits() {
     return { ...s, btc, usd: s.usdKnown ? +s.usd.toFixed(2) : null, avail, pick };
   });
 }
+const leaveOutSwitch = (p, on) => `<label class="toggle leave-out"><input type="checkbox" data-act="leave-out" data-num="${p.num}" ${on ? 'checked' : ''}>
+  I didn't pay for this contract: leave it out of returns and profit</label>`;
 // Deposits the app made from the reports (not typed in by hand). Older ones are recognised by their note.
 const isFromReports = d => d.auto === true || /^(From the reports:|Paid outside the platform for contract|Paid in USDT for order)/.test(d.note || '');
 const isAdminAdded = p => !!p.contractId && p.th > 0 && !(p.allocBtc > 0);
 // What a contract really cost: its allocated BTC, or for a contract added by hand, its worked-out value.
-const contractValue = p => (p.allocBtc > 0 ? p.allocBtc : insights().value.get(p.num) || 0);
+// A contract left out (not mining, not paid for) had no capital in it.
+const contractValue = p => (p.leaveOut && idleInfo(p) ? 0 : p.allocBtc > 0 ? p.allocBtc : insights().value.get(p.num) || 0);
 const idleInfo = p => insights().idle.find(x => x.p.num === p.num) || null;
 
 function contractRows(P) {
@@ -568,12 +584,13 @@ function contractRows(P) {
 function monthRows(R) {
   const months = new Map();
   const get = ym => {
-    if (!months.has(ym)) months.set(ym, { ym, days: 0, total: 0, cost: 0, profit: 0, bonus: 0, lossDays: 0, adjLossDays: 0, idle: 0, withdrawn: 0, bought: 0, boughtBtc: 0 });
+    if (!months.has(ym)) months.set(ym, { ym, days: 0, total: 0, cost: 0, profit: 0, bonus: 0, lossDays: 0, adjLossDays: 0, idle: 0, excluded: 0, cost0: 0, profit0: 0, withdrawn: 0, bought: 0, boughtBtc: 0 });
     return months.get(ym);
   };
   for (const d of R.days) {
     const r = get(d.date.slice(0, 7));
     r.days++; r.total += d.total; r.cost += d.cost; r.profit += d.profit; r.bonus += d.bonus; r.idle += d.idle || 0;
+    r.excluded += d.excluded || 0; r.cost0 += d.cost0 ?? d.cost; r.profit0 += d.profit0 ?? d.profit;
     if (d.profit < 0) r.lossDays++;
     if (d.profit + (d.idle || 0) < 0) r.adjLossDays++;
   }
@@ -581,6 +598,7 @@ function monthRows(R) {
   for (const p of R.P) { const r = get(p.date.slice(0, 7)); r.bought++; r.boughtBtc += contractValue(p); }
   return [...months.values()].sort((a, b) => (a.ym < b.ym ? -1 : 1)).map(r => ({
     ...r, per30: r.cost > 0 ? r.profit / r.cost : NaN,
+    platformPer30: r.excluded > 0 && r.cost0 > 0 ? r.profit0 / r.cost0 : NaN,
     adjPer30: r.idle > 0 && r.cost - r.idle > 0 ? (r.profit + r.idle) / (r.cost - r.idle) : r.cost > 0 ? r.profit / r.cost : NaN,
   }));
 }
@@ -611,7 +629,11 @@ function warnings(R) {
     const inView = days.filter(d => x.dates.has(d.date));
     const cost = sum(inView, 'cost'), profit = sum(inView, 'profit'), idle = sum(inView, 'idle');
     const mined = x.days - x.idleDays;
-    add('warn', `<b>${esc(x.p.contractId)}</b> (${x.p.th.toLocaleString('en-US')} TH/s, ${fmtDate(x.p.start)} – ${fmtDate(x.p.end)}) is on record but the report's hashrate leaves it out on ${x.idleDays} of its ${x.days} days${mined > 0 ? ` — it only mined on ${plural(mined, 'day')}` : ''}. Its capital (${fmtAmtU(x.perDay)} a day) was still taken out of those days' earnings, so they look like losses that aren't real. Over those days: <b>${fmtPct(profit / cost, 2, true)}</b> per 30 days as the platform reports it, <b>${fmtPct((profit + idle) / (cost - idle), 2, true)}</b> without this contract. Ask the platform about it; if you didn't pay for it, it cost you nothing.`);
+    add('warn', `<b>${esc(x.p.contractId)}</b> (${x.p.th.toLocaleString('en-US')} TH/s, ${fmtDate(x.p.start)} – ${fmtDate(x.p.end)}) is on record but the report's hashrate leaves it out on ${x.idleDays} of its ${x.days} days${mined > 0 ? ` — it only mined on ${plural(mined, 'day')}` : ''}. Its capital (${fmtAmtU(x.perDay)} a day) was still taken out of those days' earnings, so they look like losses that aren't real. Over those days: <b>${fmtPct(profit / cost, 2, true)}</b> per 30 days as the platform reports it, <b>${fmtPct((profit + idle) / (cost - idle), 2, true)}</b> without this contract. Ask the platform about it; if you didn't pay for it, it cost you nothing.
+      ${leaveOutSwitch(x.p, false)}`);
+  }
+  for (const x of m.leftOut) {
+    add('keep', `<b>${esc(x.p.contractId)}</b> (${x.p.th.toLocaleString('en-US')} TH/s) is left out: it was on record but not mining, and you didn't pay for it. Returns, profit and loss days count the capital the report took back for it (${fmtAmtU(x.perDay)} a day) as profit, which is what it really was. Your net result and balance are the same either way. ${leaveOutSwitch(x.p, true)}`);
   }
   const unpaid = m.admin.filter(p => !data.deposits.some(d => d.outside && (d.orders || []).includes(p.num)) && !idleInfo(p));
   if (unpaid.length) add('info', `${plural(unpaid.length, 'contract')} (#${unpaid.map(p => p.num).join(', #')}) ${unpaid.length === 1 ? 'was' : 'were'} added by the platform admin: no BTC left the balance for ${unpaid.length === 1 ? 'it' : 'them'}. If you paid for ${unpaid.length === 1 ? 'it' : 'them'} outside the platform, add ${unpaid.length === 1 ? 'it' : 'them'} as money in on the <b>Money in &amp; out</b> tab.`);
@@ -1031,6 +1053,7 @@ function renderRunning(R) {
       <span class="dot">·</span> <span class="${tone(x.profit)}">${fmtAmt(x.profit, true)} ${unitLabel()}</span> <span class="muted">profit${fiat(x.profit) ? ` (${fiat(x.profit)})` : ''}</span>
       <span class="dot">·</span> <span class="${x.lossDays ? 'neg' : ''}">${plural(x.lossDays, 'loss day')}</span> <span class="muted">of ${x.n}</span>
     </div>
+    ${x.excluded > 0 ? `<div class="running-line hint">Leaves out the contract that wasn't mining. The platform's report shows ${fmtPct(x.platformPer30, 2)} per 30 days · ${plural(x.platformLossDays, 'loss day')} ${help('You switched this on in the note at the top of the Overview. Switch it off there to see the platform\'s figures everywhere.')}</div>` : ''}
     ${x.idle > 0 ? `<div class="running-line hint">As the platform reports it. Without the contract that wasn't mining:
       <b class="${tone(x.adjPer30)}">${fmtPct(x.adjPer30, 2)}</b> per 30 days · ${plural(x.adjLossDays, 'loss day')} ${help('The report kept taking capital back for a contract its hashrate left out, so those days look worse than they were. This leaves that capital out. See the warning above.')}</div>` : ''}
   </section>`;
@@ -1040,9 +1063,11 @@ function renderRunning(R) {
 function renderNotices(R) {
   const ws = warnings(R);
   const warn = ws.filter(w => w.level === 'warn');
-  const info = prefs.notesHidden === todayIso() ? [] : ws.filter(w => w.level !== 'warn');
+  const keep = ws.filter(w => w.level === 'keep'); // notes with a switch: never hidden
+  const info = prefs.notesHidden === todayIso() ? [] : ws.filter(w => w.level === 'info');
   const out = [];
   if (warn.length) out.push(`<div class="warnings">${warn.map(w => `<div class="alert warn">⚠ <span>${w.text}</span></div>`).join('')}</div>`);
+  for (const k of keep) out.push(`<div class="note-line keep">ℹ <span>${k.text}</span></div>`);
   if (info.length) out.push(`<div class="note-line">ℹ <span>${info.map(w => w.text).join(' · ')}</span> <button class="link" data-act="hide-notes">Hide for today</button></div>`);
   const imp = renderImportPanel();
   if (imp) out.push(imp);
@@ -1238,7 +1263,7 @@ function renderContracts(R) {
     <tbody>
     ${rows.map(r => `<tr>
       ${td(r.num, r.num, '')}${td(r.date, fmtDate(r.date), '')}${td(r.end, fmtDate(r.end), '')}
-      ${td(r.active ? 0 : 1, esc(r.state) + (r.idle ? ` <span class="tag warn" title="The report's hashrate leaves this contract out on ${r.idle.idleDays} of its ${r.idle.days} days, but its capital was still taken back.">not mining ${r.idle.idleDays} of ${r.idle.days} days</span>` : '') + (r.admin ? ` <span class="tag" title="Its allocated BTC is 0: it was added by the platform admin, not bought from your balance. The cost shown is what the daily report charges back for it.">added by admin</span>` : ''), '')}
+      ${td(r.active ? 0 : 1, esc(r.state) + (r.idle ? ` <span class="tag warn" title="The report's hashrate leaves this contract out on ${r.idle.idleDays} of its ${r.idle.days} days, but its capital was still taken back.">not mining ${r.idle.idleDays} of ${r.idle.days} days</span>` : '') + (r.idle && r.leaveOut ? ` <span class="tag" title="You left it out of returns and profit (switch on the Overview), so it counts as costing nothing.">left out</span>` : '') + (r.admin ? ` <span class="tag" title="Its allocated BTC is 0: it was added by the platform admin, not bought from your balance. The cost shown is what the daily report charges back for it.">added by admin</span>` : ''), '')}
       ${td(r.th, r.th.toLocaleString('en-US'))}${td(r.value, r.admin ? `<span title="Worked out: what the daily report charges back for it (no BTC was allocated).">~${fmtAmt(r.value)}</span>` : fmtAmt(r.value))}${usdCell(r)}
       ${td(r.satsPerTh, r.satsPerTh.toFixed(0))}
       ${hasS ? (r.s ? `${td(r.s.earnedBtc, fmtAmt(r.s.earnedBtc))}${td(r.s.capitalBackBtc, fmtAmt(r.s.capitalBackBtc))}
@@ -1288,7 +1313,7 @@ function renderHistory(R) {
     <tbody>${[...months].reverse().map(mo => `<tr>
       ${td(mo.ym, fmtMonth(mo.ym), '')}${td(mo.days, mo.days)}${td(mo.total, fmtAmt(mo.total))}
       ${td(mo.profit, fmtAmt(mo.profit, true), 'n ' + tone(mo.profit))}${td(mo.profit, fiat(mo.profit) || '—')}
-      ${td(mo.per30, fmtPct(mo.per30, 2, true), 'n ' + tone(mo.per30))}
+      ${td(mo.per30, fmtPct(mo.per30, 2, true) + (isFinite(mo.platformPer30) ? `<br><small class="hint" title="What the platform's report shows, with the contract you left out still counted.">platform: ${fmtPct(mo.platformPer30, 2, true)}</small>` : ''), 'n ' + tone(mo.per30))}
       ${anyIdle ? td(mo.adjPer30, mo.idle > 0 ? `<b>${fmtPct(mo.adjPer30, 2, true)}</b> <small>· ${plural(mo.adjLossDays, 'loss day')}</small>` : '<small>same</small>', 'n ' + (mo.idle > 0 ? tone(mo.adjPer30) : '')) : ''}
       ${td(mo.lossDays, mo.lossDays || '—', 'n ' + (mo.lossDays ? 'neg' : ''))}
       ${td(mo.withdrawn, mo.withdrawn ? fmtAmt(mo.withdrawn) : '—')}${td(mo.bought, mo.bought ? `${mo.bought} <small>(${fmtAmt(mo.boughtBtc)})</small>` : '—')}
@@ -1526,7 +1551,7 @@ function renderMoney(R) {
   const autoDeps = deposits.filter(isFromReports);
   const orderChoices = R.P.filter(p => p.allocUsd > 0 && !usedOrders.has(p.num));
   const needReimport = R.P.some(p => !(p.allocUsd > 0) && !isAdminAdded(p));
-  const adminChoices = data.purchases.filter(p => isAdminAdded(p) && !usedOrders.has(p.num));
+  const adminChoices = data.purchases.filter(p => isAdminAdded(p) && !usedOrders.has(p.num) && !(p.leaveOut && idleInfo(p)));
   const suggestions = suggestedDeposits();
   const orderList = list => list.map(p => `#${p}`).join(', ');
 
@@ -2201,6 +2226,15 @@ function bind() {
       return;
     }
     if (e.target.dataset.act === 'group-daily') { groupDaily = e.target.checked; render(); return; }
+    if (e.target.dataset.act === 'leave-out') {
+      const p = data.purchases.find(x => x.num === +e.target.dataset.num);
+      if (p) {
+        if (e.target.checked) p.leaveOut = true; else delete p.leaveOut;
+        save(); render();
+        toast(e.target.checked ? `${p.contractId} is left out of returns and profit` : `${p.contractId} is counted again, as the platform reports it`);
+      }
+      return;
+    }
     const row = e.target.closest('[data-cycle]');
     if (row) {
       const c = data.cycles.find(x => x.id === row.dataset.cycle);

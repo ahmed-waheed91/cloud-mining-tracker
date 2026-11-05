@@ -253,6 +253,11 @@ button.link.quiet { color: var(--muted); font-size: 12.5px; }
 .notices .alert { padding: 7px 12px; font-size: 13.5px; }
 .note-line { display: flex; gap: 8px 12px; align-items: baseline; flex-wrap: wrap; color: var(--muted); font-size: 13px; padding: 0 2px; }
 .note-line .link { font-size: 12.5px; }
+.note-line.keep { flex-wrap: nowrap; }
+.note-line.keep > span { flex: 1 1 0; min-width: 0; }
+.toggle.leave-out { display: flex; margin-top: 8px; color: var(--text); font-weight: 600; }
+.note-line .toggle.leave-out { margin-top: 4px; font-weight: 500; }
+.toggle.leave-out input { width: 16px; height: 16px; accent-color: var(--accent); }
 .note-line > button.link { color: var(--muted); }
 .import-line details { flex: 1; min-width: 0; }
 .import-line summary { cursor: pointer; list-style: none; display: flex; gap: 12px; flex-wrap: wrap; }
