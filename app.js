@@ -4,7 +4,7 @@
 // Data lives in a folder the user picks (File System Access API, Chrome): cloud-mining.json
 // plus daily backups. It is mirrored to localStorage so nothing is lost while disconnected.
 
-const APP_VERSION = '1.6.0';
+const APP_VERSION = '1.7.0';
 const DATA_VERSION = 2;
 const STORAGE_KEY = 'cloud-mining-data';
 const PREFS_KEY = 'cloud-mining-prefs';
@@ -569,10 +569,55 @@ function render() {
   const R = compute(currentScope);
   const views = { overview: renderOverview, contracts: renderContracts, history: renderHistory, projection: renderProjection, money: renderMoney, settings: renderSettings };
   main.innerHTML = (views[currentTab] || renderOverview)(R);
+  const tabChanged = currentTab !== lastRenderedTab;
+  lastRenderedTab = currentTab;
+  if (tabChanged) { main.classList.remove('fade-in'); void main.offsetWidth; main.classList.add('fade-in'); }
+  moveTabInk();
+  if (currentTab === 'overview' && tabChanged) animateHero(main);
   if (currentTab === 'overview') drawOverviewCharts(R);
   if (currentTab === 'contracts') drawContractChart(R);
   if (currentTab === 'projection') drawProjection(R);
   main.querySelectorAll('table[data-sort-id]').forEach(applySort);
+}
+
+// ---------- small motion touches (all skipped when the system asks for reduced motion) ----------
+const RING_LEN = +(2 * Math.PI * 38).toFixed(1);
+let lastRenderedTab = null;
+const reducedMotion = () => matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+// The gradient line under the active tab slides to it.
+function moveTabInk() {
+  const tabs = $('#tabs');
+  let ink = tabs.querySelector('.tab-ink');
+  if (!ink) { ink = Object.assign(document.createElement('span'), { className: 'tab-ink' }); tabs.append(ink); }
+  const b = tabs.querySelector('button.active');
+  if (!b) { ink.style.width = '0'; return; }
+  ink.style.left = `${b.offsetLeft}px`;
+  ink.style.width = `${b.offsetWidth}px`;
+  ink.style.top = `${b.offsetTop + b.offsetHeight - 2}px`;
+}
+
+// Net result counts up and the money-back ring fills, when the Overview is opened.
+function animateHero(root) {
+  if (reducedMotion()) return;
+  const ring = root.querySelector('.ring .fill');
+  if (ring) {
+    const end = ring.getAttribute('stroke-dasharray');
+    ring.style.transition = 'none';
+    ring.setAttribute('stroke-dasharray', `0 ${RING_LEN}`);
+    requestAnimationFrame(() => requestAnimationFrame(() => { ring.style.transition = ''; ring.setAttribute('stroke-dasharray', end); }));
+  }
+  const el = root.querySelector('[data-count]');
+  const target = el ? +el.dataset.count : NaN;
+  if (!isFinite(target) || !target) return;
+  const t0 = performance.now(), dur = 900;
+  const step = t => {
+    if (!el.isConnected) return;
+    const k = Math.min(1, (t - t0) / dur), e = 1 - Math.pow(1 - k, 3);
+    el.textContent = fmtAmt(k < 1 ? target * e : target, true);
+    if (k < 1) requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
 }
 
 function renderTopbar() {
@@ -583,7 +628,7 @@ function renderTopbar() {
   sel.value = currentScope;
   const p = usdPrice();
   $('#price').innerHTML = p
-    ? `BTC <b>${fmtMoney(p)}</b> <span title="${btcUsd ? 'Live price' : 'No live price — using the BTC/USD from the latest daily report'}">${btcUsd ? '· live' : '· last report'}</span>`
+    ? `${btcUsd ? '<span class="live-dot" aria-hidden="true"></span>' : ''}BTC <b>${fmtMoney(p)}</b> <span title="${btcUsd ? 'Live price' : 'No live price — using the BTC/USD from the latest daily report'}">${btcUsd ? '· live' : '· last report'}</span>`
     : 'BTC price unavailable';
   document.querySelectorAll('.seg[data-pref]').forEach(seg => {
     seg.querySelectorAll('button').forEach(b => b.classList.toggle('on', prefs[seg.dataset.pref] === b.dataset.v));
@@ -781,14 +826,20 @@ function renderHero(R) {
     <div class="hero-top">
       <div>
         <div class="label">${m.in ? 'Net result' : 'Profit so far'} ${help(m.in ? 'Withdrawn + still on the platform − money in. This is your real profit or loss after loss days.' : 'No deposit is recorded yet, so this is the profit from the daily report only.')}</div>
-        <div class="big ${tone(m.in ? m.net : m.profit)}">${fmtAmt(m.in ? m.net : m.profit, true)} <small>${unitLabel()}</small></div>
+        <div class="big ${tone(m.in ? m.net : m.profit)}"><span data-count="${m.in ? m.net : m.profit}">${fmtAmt(m.in ? m.net : m.profit, true)}</span> <small>${unitLabel()}</small></div>
         <div class="usd">${fiat(m.in ? m.net : m.profit) ? '≈ ' + fiat(m.in ? m.net : m.profit) : ''}${m.in ? ` · ${fmtPct(m.retOnIn, 2, true)} of money in` : ''}</div>
       </div>
       ${m.in ? `<div class="back">
-        <div class="label">Money back in your wallet</div>
-        <div class="back-pct">${fmtPct(pct, 1)}</div>
-        <div class="progress"><div style="width:${(pct * 100).toFixed(1)}%"></div></div>
-        <div class="hint">${fmtAmtU(m.recovered)} of ${fmtAmtU(m.in)}${m.carriedOut ? ' (incl. carried over)' : ''}. ${backText}</div>
+        <svg class="ring" viewBox="0 0 92 92" role="img" aria-label="${fmtPct(pct, 1)} of money in is back">
+          <defs><linearGradient id="ringGrad" x1="0" x2="1" y1="0" y2="1"><stop offset="0" stop-color="var(--accent)"/><stop offset="1" stop-color="var(--accent-2)"/></linearGradient></defs>
+          <circle class="track" cx="46" cy="46" r="38"/>
+          <circle class="fill" cx="46" cy="46" r="38" transform="rotate(-90 46 46)" data-ring="${pct}" stroke-dasharray="${(pct * RING_LEN).toFixed(1)} ${RING_LEN}"/>
+          <text class="ring-pct" x="46" y="51" text-anchor="middle">${fmtPct(pct, 1)}</text>
+        </svg>
+        <div class="back-text">
+          <div class="label">Money back in your wallet</div>
+          <div class="hint">${fmtAmtU(m.recovered)} of ${fmtAmtU(m.in)}${m.carriedOut ? ' (incl. carried over)' : ''}. ${backText}</div>
+        </div>
       </div>` : ''}
     </div>
     <div class="hero-stats">
@@ -842,8 +893,37 @@ function chartTheme() {
     plugins: { legend: { labels: { color: muted, boxWidth: 12 } } },
     scales: { x: { ticks: { color: muted, maxRotation: 0, autoSkipPadding: 16 }, grid: { color: grid } } },
   };
-  const yAxis = (extra = {}) => ({ ticks: { color: muted }, grid: { color: grid }, ...extra });
-  return { v, base, yAxis };
+  const yAxis = (extra = {}) => ({ ticks: { color: muted }, grid: { color: grid }, border: { display: false }, ...extra });
+  base.scales.x.border = { display: false };
+  base.scales.x.grid = { display: false };
+  // Vertical fade from `top` to `bottom` (colors), for bars and filled areas.
+  const fade = (top, bottom) => ({ chart }) => {
+    const a = chart.chartArea;
+    if (!a) return top;
+    const g = chart.ctx.createLinearGradient(0, a.top, 0, a.bottom);
+    g.addColorStop(0, top);
+    g.addColorStop(1, bottom);
+    return g;
+  };
+  const alpha = (c, a) => (/^#[0-9a-f]{6}$/i.test(c) ? c + Math.round(a * 255).toString(16).padStart(2, '0') : c);
+  return { v, base, yAxis, fade, alpha };
+}
+// Soft glow on line charts in the dark theme.
+if (typeof Chart !== 'undefined') {
+  Chart.defaults.font.family = "Inter, system-ui, sans-serif";
+  Chart.register({
+    id: 'glow',
+    beforeDatasetDraw(chart, { meta }) {
+      const on = +getComputedStyle(document.documentElement).getPropertyValue('--glow-on') || 0;
+      if (!on || meta.type !== 'line') return;
+      const ds = chart.data.datasets[meta.index];
+      chart.ctx.save();
+      chart.ctx.shadowColor = typeof ds.borderColor === 'string' ? ds.borderColor : 'transparent';
+      chart.ctx.shadowBlur = 10;
+      meta._glow = true;
+    },
+    afterDatasetDraw(chart, { meta }) { if (meta._glow) { chart.ctx.restore(); meta._glow = false; } },
+  });
 }
 const dayLabel = d => new Date(d + 'T00:00:00').toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
 
@@ -851,14 +931,14 @@ function drawOverviewCharts(R) {
   const el = $("#chOverview");
   if (typeof Chart === "undefined" || !R.days.length || !el) return;
   const which = OV_CHARTS[prefs.ovChart] ? prefs.ovChart : "daily";
-  const { v, base, yAxis } = chartTheme();
+  const { v, base, yAxis, fade, alpha } = chartTheme();
   const k = unitScale();
   const days = R.days;
   if (which === 'daily') charts.daily = new Chart(el, {
     data: {
       labels: days.map(d => dayLabel(d.date)),
       datasets: [
-        { type: 'bar', label: `Profit ${unitLabel()}`, data: days.map(d => d.profit * k), backgroundColor: days.map(d => (d.profit < 0 ? v('--neg') : v('--chart-1'))), yAxisID: 'y' },
+        { type: 'bar', label: `Profit ${unitLabel()}`, data: days.map(d => d.profit * k), backgroundColor: c => (c.raw < 0 ? v('--neg') : fade(v('--accent-2'), alpha(v('--chart-1'), 0.3))(c)), borderRadius: 2, yAxisID: 'y' },
         { type: 'line', label: 'Return/day %', data: days.map(d => d.ret * 100), borderColor: v('--chart-2'), pointRadius: 0, borderWidth: 2, yAxisID: 'y1' },
       ],
     },
@@ -872,7 +952,7 @@ function drawOverviewCharts(R) {
     type: 'line',
     data: {
       labels: span.map(dayLabel),
-      datasets: [{ label: 'Capital working', data: span.map(d => sum(R.P.filter(p => p.start <= d && d <= p.end), 'allocBtc') * k), borderColor: v('--chart-1'), backgroundColor: v('--chart-1') + '33', fill: true, pointRadius: 0, stepped: true }],
+      datasets: [{ label: 'Capital working', data: span.map(d => sum(R.P.filter(p => p.start <= d && d <= p.end), 'allocBtc') * k), borderColor: v('--chart-1'), backgroundColor: fade(alpha(v('--chart-1'), 0.35), alpha(v('--chart-1'), 0)), fill: true, pointRadius: 0, stepped: true }],
     },
     options: { ...base, scales: { ...base.scales, y: yAxis({ beginAtZero: true }) } },
   });
@@ -898,7 +978,7 @@ function drawOverviewCharts(R) {
 function drawContractChart(R) {
   const el = $('#chPrice');
   if (typeof Chart === 'undefined' || !el) return;
-  const { v, base, yAxis } = chartTheme();
+  const { v, base, yAxis, fade, alpha } = chartTheme();
   const rows = contractRows(R.P);
   const prices = rows.map(r => r.satsPerTh).filter(isFinite);
   const lo = Math.min(...prices), hi = Math.max(...prices);
@@ -907,7 +987,7 @@ function drawContractChart(R) {
     data: {
       labels: rows.map(r => `#${r.num} · ${dayLabel(r.date)}`),
       datasets: [
-        { type: 'bar', label: 'Price (sats per TH, 30 days)', data: rows.map(r => r.satsPerTh), backgroundColor: v('--chart-1'), yAxisID: 'y' },
+        { type: 'bar', label: 'Price (sats per TH, 30 days)', data: rows.map(r => r.satsPerTh), backgroundColor: fade(v('--accent-2'), alpha(v('--chart-1'), 0.35)), borderRadius: 3, yAxisID: 'y' },
         { type: 'line', label: 'Margin %', data: rows.map(r => (r.s && isFinite(r.s.marginPct) ? r.s.marginPct : null)), borderColor: v('--chart-3'), backgroundColor: v('--chart-3'), pointRadius: 3, borderWidth: 2, yAxisID: 'y1', spanGaps: true },
       ],
     },
@@ -1755,6 +1835,8 @@ function toast(msg, err = false) {
 }
 
 function bind() {
+  addEventListener('resize', moveTabInk);
+  document.fonts?.ready.then(moveTabInk);
   // Remember open/closed <details data-fold="…"> sections per browser, like the other display prefs.
   document.addEventListener('toggle', e => {
     const f = e.target.dataset?.fold;

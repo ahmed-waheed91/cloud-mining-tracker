@@ -1,0 +1,2 @@
+Inter (https://github.com/rsms/inter) and JetBrains Mono (https://github.com/JetBrains/JetBrainsMono),
+variable latin subsets from Fontsource. Both are licensed under the SIL Open Font License 1.1.

@@ -5,16 +5,18 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Cloud Mining Tracker</title>
 <meta name="description" content="Track BTC cloud-mining contracts, reinvestments and payouts. Your data stays on your own computer.">
-<meta name="theme-color" content="#e07b1a">
+<meta name="theme-color" content="#070a12">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="icons/icon-192.png">
+<link rel="preload" href="vendor/fonts/inter-var.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="vendor/fonts/jetbrains-mono-var.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="app.css">
 <script src="vendor/chart.umd.min.js"></script>
 </head>
 <body>
 <header class="topbar">
-  <div class="brand" title="Cloud Mining Tracker">₿ Cloud Mining Tracker <span id="version" class="version"></span></div>
+  <div class="brand" title="Cloud Mining Tracker"><span class="brand-mark">₿</span> Cloud Mining Tracker <span id="version" class="version"></span></div>
   <nav class="tabs" id="tabs">
     <button data-tab="overview" class="active">Overview</button>
     <button data-tab="contracts">Contracts</button>
