@@ -4,7 +4,7 @@
 // Data lives in a folder the user picks (File System Access API, Chrome): cloud-mining.json
 // plus daily backups. It is mirrored to localStorage so nothing is lost while disconnected.
 
-const APP_VERSION = '1.8.0';
+const APP_VERSION = '1.8.1';
 const DATA_VERSION = 3; // 3: deposits may have outside: true (paid straight for admin-added contracts)
 const STORAGE_KEY = 'cloud-mining-data';
 const PREFS_KEY = 'cloud-mining-prefs';
@@ -208,7 +208,7 @@ function importPurchases(body, file) {
     const n = parseInt(bought['#'], 10);
     if (!used.has(bought) && !pairs.some(p => p.n === n)) pairs.push({ n, alloc: null, bought });
   }
-  let added = 0, updated = 0;
+  let added = 0, updated = 0, rematched = 0;
   for (const { n, alloc, bought } of pairs) {
     const any = alloc || bought;
     const prev = data.purchases.find(p => p.num === n);
@@ -224,10 +224,12 @@ function importPurchases(body, file) {
       contractId: alloc ? alloc['Contract'] : prev?.contractId ?? '',
       status: (alloc || bought)['Status'],
     };
+    if (prev && (prev.date !== rec.date || prev.th !== rec.th || prev.allocBtc !== rec.allocBtc)) rematched++;
     if (prev) { Object.assign(prev, rec); updated++; } else { data.purchases.push(rec); added++; }
   }
   data.purchases.sort((a, b) => a.num - b.num);
-  return { file, ok: true, msg: `Purchases: ${added} new contracts, ${updated} refreshed.` };
+  const auto = data.deposits.filter(isFromReports).length;
+  return { file, ok: true, msg: `Purchases: ${added} new contracts, ${updated} refreshed.${rematched ? ` ${plural(rematched, 'contract')} matched to the right purchase line now.${auto ? ' The deposits added from the reports were based on the old matching: on Money in & out, use "Remove all deposits added from the reports", then add them again.' : ''}` : ''}` };
 }
 
 function importPayouts(body, file) {
@@ -540,6 +542,8 @@ function suggestedDeposits() {
     return { ...s, btc, usd: s.usdKnown ? +s.usd.toFixed(2) : null, avail, pick };
   });
 }
+// Deposits the app made from the reports (not typed in by hand). Older ones are recognised by their note.
+const isFromReports = d => d.auto === true || /^(From the reports:|Paid outside the platform for contract|Paid in USDT for order)/.test(d.note || '');
 const isAdminAdded = p => !!p.contractId && p.th > 0 && !(p.allocBtc > 0);
 // What a contract really cost: its allocated BTC, or for a contract added by hand, its worked-out value.
 const contractValue = p => (p.allocBtc > 0 ? p.allocBtc : insights().value.get(p.num) || 0);
@@ -1519,6 +1523,7 @@ function renderMoney(R) {
   const depVals = deposits.map(depositUsd);
   const payVals = payouts.map(payoutUsd);
   const usedOrders = new Set(data.deposits.flatMap(d => d.orders || []));
+  const autoDeps = deposits.filter(isFromReports);
   const orderChoices = R.P.filter(p => p.allocUsd > 0 && !usedOrders.has(p.num));
   const needReimport = R.P.some(p => !(p.allocUsd > 0) && !isAdminAdded(p));
   const adminChoices = data.purchases.filter(p => isAdminAdded(p) && !usedOrders.has(p.num));
@@ -1593,6 +1598,8 @@ function renderMoney(R) {
         <td class="actions"><button data-act="edit" data-type="deposit" data-id="${d.id}">Edit</button><button class="danger" data-act="del-deposit" data-id="${d.id}">Delete</button></td></tr>`).join('')}
     ${deposits.length > 1 ? `<tr class="total"><td colspan="3">Total (${deposits.length})</td><td class="n">${fmtAmt(sum(deposits, 'btc'))}</td>${valueCells(sumUsd(depVals), sum(deposits, 'btc'), 'Includes estimates.')}<td></td><td></td></tr>` : ''}</tbody>
   </table></div>` : ''}
+  ${autoDeps.length ? `<p class="hint" style="margin-top:8px"><button class="danger" data-act="del-auto">Remove all ${plural(autoDeps.length, 'deposit')} added from the reports</button>
+    ${help('Removes the deposits added from "Suggested money in", "Contracts added by the platform admin" and "Add a deposit from orders you paid in USDT" in this view. Deposits you typed in yourself stay. Use it to start those over, for example after importing the hashrate purchases report again.')}</p>` : ''}
   </div><div>
 
   <h2>Payouts to your wallet</h2>
@@ -2161,6 +2168,14 @@ function bind() {
       if (v.cycleId) rec.cycleId = v.cycleId;
       if ('usd' in v) rec.usd = num(v.usd) > 0 ? num(v.usd) : null;
       editing = null; save(); render(); toast('Saved');
+    }
+    else if (act === 'del-auto') {
+      const gone = data.deposits.filter(d => isFromReports(d) && (currentScope === 'all' || d.cycleId === currentScope));
+      if (gone.length && confirm(`Remove ${plural(gone.length, 'deposit')} added from the reports (${fmtAmtU(sum(gone, 'btc'))})? Deposits you typed in yourself are kept.`)) {
+        const ids = new Set(gone.map(d => d.id));
+        data.deposits = data.deposits.filter(d => !ids.has(d.id));
+        save(); render(); toast(`${plural(gone.length, 'deposit')} removed. Add them again from the lists above.`);
+      }
     }
     else if (act === 'del-deposit' && confirm('Delete this deposit?')) { data.deposits = data.deposits.filter(d => d.id !== id); save(); render(); }
     else if (act === 'del-check' && confirm('Delete this balance check?')) { data.balanceChecks = data.balanceChecks.filter(d => d.id !== id); save(); render(); }
