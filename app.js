@@ -4,7 +4,7 @@
 // Data lives in a folder the user picks (File System Access API, Chrome): cloud-mining.json
 // plus daily backups. It is mirrored to localStorage so nothing is lost while disconnected.
 
-const APP_VERSION = '1.9.0';
+const APP_VERSION = '1.9.1';
 const DATA_VERSION = 3; // 3: deposits may have outside: true (paid straight for admin-added contracts)
 const STORAGE_KEY = 'cloud-mining-data';
 const PREFS_KEY = 'cloud-mining-prefs';
@@ -555,8 +555,10 @@ function suggestedDeposits() {
     return { ...s, btc, usd: s.usdKnown ? +s.usd.toFixed(2) : null, avail, pick };
   });
 }
-const leaveOutSwitch = (p, on) => `<label class="toggle leave-out"><input type="checkbox" data-act="leave-out" data-num="${p.num}" ${on ? 'checked' : ''}>
-  I didn't pay for this contract: leave it out of returns and profit</label>`;
+const leaveOutSwitch = (p, on) => `<span class="leave-out"><span class="leave-out-label">Returns and profit:</span>
+  <span class="seg small" role="group" aria-label="How to count ${esc(p.contractId)}">
+    <button data-act="leave-out" data-num="${p.num}" data-v="count" class="${on ? '' : 'on'}" aria-pressed="${!on}" title="Count it, as the platform's report does">Platform's figures</button><button data-act="leave-out" data-num="${p.num}" data-v="out" class="${on ? 'on' : ''}" aria-pressed="${on}" title="I didn't pay for this contract: count the capital the report took back for it as profit">Leave it out</button>
+  </span>${help('Choose "Leave it out" if you did not pay for this contract. Returns, profit, loss days and charts then show what really happened. Your net result and balance are the same either way, and you can switch back at any time.')}</span>`;
 // Deposits the app made from the reports (not typed in by hand). Older ones are recognised by their note.
 const isFromReports = d => d.auto === true || /^(From the reports:|Paid outside the platform for contract|Paid in USDT for order)/.test(d.note || '');
 const isAdminAdded = p => !!p.contractId && p.th > 0 && !(p.allocBtc > 0);
@@ -2194,6 +2196,15 @@ function bind() {
       if ('usd' in v) rec.usd = num(v.usd) > 0 ? num(v.usd) : null;
       editing = null; save(); render(); toast('Saved');
     }
+    else if (act === 'leave-out') {
+      const p = data.purchases.find(x => x.num === +b.dataset.num);
+      const on = b.dataset.v === 'out';
+      if (p && !!p.leaveOut !== on) {
+        if (on) p.leaveOut = true; else delete p.leaveOut;
+        save(); render();
+        toast(on ? `${p.contractId} is left out of returns and profit` : `${p.contractId} is counted again, as the platform reports it`);
+      }
+    }
     else if (act === 'del-auto') {
       const gone = data.deposits.filter(d => isFromReports(d) && (currentScope === 'all' || d.cycleId === currentScope));
       if (gone.length && confirm(`Remove ${plural(gone.length, 'deposit')} added from the reports (${fmtAmtU(sum(gone, 'btc'))})? Deposits you typed in yourself are kept.`)) {
@@ -2226,15 +2237,6 @@ function bind() {
       return;
     }
     if (e.target.dataset.act === 'group-daily') { groupDaily = e.target.checked; render(); return; }
-    if (e.target.dataset.act === 'leave-out') {
-      const p = data.purchases.find(x => x.num === +e.target.dataset.num);
-      if (p) {
-        if (e.target.checked) p.leaveOut = true; else delete p.leaveOut;
-        save(); render();
-        toast(e.target.checked ? `${p.contractId} is left out of returns and profit` : `${p.contractId} is counted again, as the platform reports it`);
-      }
-      return;
-    }
     const row = e.target.closest('[data-cycle]');
     if (row) {
       const c = data.cycles.find(x => x.id === row.dataset.cycle);
