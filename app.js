@@ -4,7 +4,7 @@
 // Data lives in a folder the user picks (File System Access API, Chrome): cloud-mining.json
 // plus daily backups. It is mirrored to localStorage so nothing is lost while disconnected.
 
-const APP_VERSION = '1.5.0';
+const APP_VERSION = '1.5.1';
 const DATA_VERSION = 2;
 const STORAGE_KEY = 'cloud-mining-data';
 const PREFS_KEY = 'cloud-mining-prefs';
@@ -544,7 +544,7 @@ function simulate({ contracts, balance, rate, days, reinvest, block, payoutAt })
 }
 
 // ---------- rendering ----------
-function help(text) { return `<span class="help" title="${esc(text)}">?</span>`; }
+function help(text) { return `<span class="help" tabindex="0" role="button" aria-label="${esc(text)}" data-tip="${esc(text)}">?</span>`; }
 function card(label, btc, opts = {}) {
   const isText = opts.text != null;
   const valueHtml = isText ? esc(opts.text) : `${fmtAmt(btc, opts.sign)} <small>${unitLabel()}</small>`;
@@ -1870,6 +1870,37 @@ async function init() {
     navigator.serviceWorker.register('sw.js').catch(() => { /* offline support is optional */ });
   }
 }
+
+
+// ---------- help popups for the "?" marks (hover, keyboard focus, or tap) ----------
+const tipEl = Object.assign(document.createElement('div'), { className: 'tip-pop', role: 'tooltip' });
+let tipFor = null;
+function showTip(el) {
+  if (!el.dataset.tip) return;
+  tipFor = el;
+  tipEl.textContent = el.dataset.tip;
+  if (!tipEl.isConnected) document.body.append(tipEl);
+  tipEl.style.display = 'block';
+  const r = el.getBoundingClientRect(), w = tipEl.offsetWidth, h = tipEl.offsetHeight, pad = 8;
+  let left = Math.min(Math.max(pad, r.left + r.width / 2 - w / 2), innerWidth - w - pad);
+  let top = r.top - h - 8;
+  if (top < pad) top = r.bottom + 8;
+  tipEl.style.left = `${left}px`;
+  tipEl.style.top = `${top}px`;
+}
+function hideTip() { tipFor = null; tipEl.style.display = 'none'; }
+document.addEventListener('mouseover', e => { const h = e.target.closest?.('.help'); if (h && h !== tipFor) showTip(h); });
+document.addEventListener('mouseout', e => { const h = e.target.closest?.('.help'); if (h && !h.contains(e.relatedTarget) && document.activeElement !== h) hideTip(); });
+document.addEventListener('focusin', e => { if (e.target.classList?.contains('help')) showTip(e.target); });
+document.addEventListener('focusout', e => { if (e.target.classList?.contains('help')) hideTip(); });
+document.addEventListener('click', e => {
+  const h = e.target.closest?.('.help');
+  if (h) { e.preventDefault(); e.stopPropagation(); tipFor === h && tipEl.style.display === 'block' && e.pointerType !== 'mouse' ? hideTip() : showTip(h); }
+  else if (tipFor) hideTip();
+}, true);
+document.addEventListener('keydown', e => { if (e.key === 'Escape') hideTip(); });
+addEventListener('scroll', hideTip, true);
+addEventListener('resize', hideTip);
 
 // Exposed for testing and for loading data from the console.
 window.cloudMining = { importCsv, compute, warnings, simulate, get data() { return data; }, set data(v) { data = migrate(v); render(); }, save, render };

@@ -221,3 +221,12 @@ th.grp-start, td.grp-start { border-left: 1px solid var(--border); }
 td.platform { color: var(--muted); }
 .pill { display: inline-block; font-size: 11px; font-weight: 600; padding: 1px 7px; border-radius: 999px; background: var(--panel-2); border: 1px solid var(--border); color: var(--muted); vertical-align: 1px; }
 tr.current td { background: var(--panel-2); }
+
+.help:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.help:hover { color: var(--text); border-color: var(--text); }
+.tip-pop {
+  display: none; position: fixed; z-index: 1000; max-width: min(320px, calc(100vw - 16px));
+  background: var(--panel-2, var(--panel)); color: var(--text); border: 1px solid var(--border); border-radius: 8px;
+  padding: 8px 10px; font-size: 12.5px; line-height: 1.45; white-space: normal; text-align: left; font-weight: 400;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, .25); pointer-events: none;
+}
