@@ -4,7 +4,7 @@
 // Data lives in a folder the user picks (File System Access API, Chrome): cloud-mining.json
 // plus daily backups. It is mirrored to localStorage so nothing is lost while disconnected.
 
-const APP_VERSION = '1.9.1';
+const APP_VERSION = '1.9.2';
 const DATA_VERSION = 3; // 3: deposits may have outside: true (paid straight for admin-added contracts)
 const STORAGE_KEY = 'cloud-mining-data';
 const PREFS_KEY = 'cloud-mining-prefs';
@@ -186,15 +186,22 @@ function importEarnings(body, file) {
   return { file, ok: true, msg: `Daily earnings: ${dates.size} days (${newDays} new, ${dates.size - newDays} refreshed).` };
 }
 
-// Purchases: each order # appears as a "purchased" line (what you paid) and an
-// "allocated" line (what went into the contract). Merge into one record per #.
+// Purchases: each order # appears as a "purchased" line (what you paid) and a contract line (what went
+// into the contract). Merge into one record per #.
+// Lines are told apart by the Contract column, never by Type: a purchased line's Contract is
+// "Custom · N TH/s · 30d", a contract line's is its id. Type is "allocated" for the main account, but for a
+// contract placed in a sub-account it is the sub-account's name, which the user can rename at any time.
+// A contract bought from the balance by the platform's auto-reinvest has no purchased line at all.
 // The two lines of an order usually share its #, but not always: a contract added by hand on the platform
-// (no "purchased" line) shifts every later contract's # by one. So each contract ("allocated" line, the
-// order's identity) is paired with the purchased line of the same day, start and TH/s, nearest # first.
+// (no "purchased" line) shifts every later contract's # by one. So each contract line (the order's
+// identity) is paired with the purchased line of the same day, start and TH/s, nearest # first.
+const isBuyLine = r => r['Contract'] ? /^custom\b/i.test(r['Contract']) : /purchas/i.test(r['Type']);
+// The sub-account a contract line went into ('' = main account).
+const subAccountOf = r => (/^alloc/i.test(r['Type']) ? '' : r['Type'] || '');
 function importPurchases(body, file) {
   const rows = body.filter(r => parseInt(r['#'], 10));
-  const allocs = rows.filter(r => /alloc/i.test(r['Type'])).sort((a, b) => parseInt(a['#'], 10) - parseInt(b['#'], 10));
-  const buys = rows.filter(r => /purchas/i.test(r['Type']));
+  const allocs = rows.filter(r => !isBuyLine(r)).sort((a, b) => parseInt(a['#'], 10) - parseInt(b['#'], 10));
+  const buys = rows.filter(isBuyLine);
   const key = r => `${r['Purchased']}|${r['Start']}|${num(r['TH/s'])}`;
   const used = new Set();
   const pairs = allocs.map(alloc => {
@@ -225,12 +232,15 @@ function importPurchases(body, file) {
       contractId: alloc ? alloc['Contract'] : prev?.contractId ?? '',
       status: (alloc || bought)['Status'],
     };
+    const sub = alloc ? subAccountOf(alloc) : prev?.subAccount ?? '';
+    if (sub) rec.subAccount = sub; else if (prev) delete prev.subAccount;
     if (prev && (prev.date !== rec.date || prev.th !== rec.th || prev.allocBtc !== rec.allocBtc)) rematched++;
     if (prev) { Object.assign(prev, rec); updated++; } else { data.purchases.push(rec); added++; }
   }
   data.purchases.sort((a, b) => a.num - b.num);
   const auto = data.deposits.filter(isFromReports).length;
-  return { file, ok: true, msg: `Purchases: ${added} new contracts, ${updated} refreshed.${rematched ? ` ${plural(rematched, 'contract')} matched to the right purchase line now.${auto ? ' The deposits added from the reports were based on the old matching: on Money in & out, use "Remove all deposits added from the reports", then add them again.' : ''}` : ''}` };
+  const subs = [...new Set(allocs.map(subAccountOf).filter(Boolean))];
+  return { file, ok: true, msg: `Purchases: ${added} new contracts, ${updated} refreshed.${subs.length ? ` Sub-accounts: ${subs.join(', ')}.` : ''}${rematched ? ` ${plural(rematched, 'contract')} matched to the right purchase line now.${auto ? ' The deposits added from the reports were based on the old matching: on Money in & out, use "Remove all deposits added from the reports", then add them again.' : ''}` : ''}` };
 }
 
 function importPayouts(body, file) {
@@ -1265,7 +1275,7 @@ function renderContracts(R) {
     <tbody>
     ${rows.map(r => `<tr>
       ${td(r.num, r.num, '')}${td(r.date, fmtDate(r.date), '')}${td(r.end, fmtDate(r.end), '')}
-      ${td(r.active ? 0 : 1, esc(r.state) + (r.idle ? ` <span class="tag warn" title="The report's hashrate leaves this contract out on ${r.idle.idleDays} of its ${r.idle.days} days, but its capital was still taken back.">not mining ${r.idle.idleDays} of ${r.idle.days} days</span>` : '') + (r.idle && r.leaveOut ? ` <span class="tag" title="You left it out of returns and profit (switch on the Overview), so it counts as costing nothing.">left out</span>` : '') + (r.admin ? ` <span class="tag" title="Its allocated BTC is 0: it was added by the platform admin, not bought from your balance. The cost shown is what the daily report charges back for it.">added by admin</span>` : ''), '')}
+      ${td(r.active ? 0 : 1, esc(r.state) + (r.idle ? ` <span class="tag warn" title="The report's hashrate leaves this contract out on ${r.idle.idleDays} of its ${r.idle.days} days, but its capital was still taken back.">not mining ${r.idle.idleDays} of ${r.idle.days} days</span>` : '') + (r.idle && r.leaveOut ? ` <span class="tag" title="You left it out of returns and profit (switch on the Overview), so it counts as costing nothing.">left out</span>` : '') + (r.admin ? ` <span class="tag" title="Its allocated BTC is 0: it was added by the platform admin, not bought from your balance. The cost shown is what the daily report charges back for it.">added by admin</span>` : '') + (r.subAccount ? ` <span class="tag" title="Placed in your sub-account &quot;${esc(r.subAccount)}&quot; (from the report's Type column)">${esc(r.subAccount)}</span>` : ''), '')}
       ${td(r.th, r.th.toLocaleString('en-US'))}${td(r.value, r.admin ? `<span title="Worked out: what the daily report charges back for it (no BTC was allocated).">~${fmtAmt(r.value)}</span>` : fmtAmt(r.value))}${usdCell(r)}
       ${td(r.satsPerTh, r.satsPerTh.toFixed(0))}
       ${hasS ? (r.s ? `${td(r.s.earnedBtc, fmtAmt(r.s.earnedBtc))}${td(r.s.capitalBackBtc, fmtAmt(r.s.capitalBackBtc))}
