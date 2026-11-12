@@ -281,6 +281,14 @@ button.link.quiet { color: var(--muted); font-size: 12.5px; }
 .hero-fiat b.pos { color: var(--pos); } .hero-fiat b.neg { color: var(--neg); }
 .hero-fiat .lead { font-weight: 600; color: var(--text); }
 
+/* v1.12.0: today's split when buying and withdrawing by hand */
+.hero.manual { margin-top: 16px; }
+.manual .hero-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); margin-top: 12px; padding-top: 0; border-top: 0; }
+.manual .mini .v { font-size: 20px; }
+.manual .todo { font-size: 13.5px; margin-top: 6px; }
+.manual form.inline { padding-top: 12px; border-top: 1px solid var(--border); }
+@media (max-width: 760px) { .manual .hero-stats { grid-template-columns: 1fr; } }
+
 .running-head { display: flex; align-items: center; gap: 12px; justify-content: space-between; margin: 28px 0 8px; }
 .running-head h2 { margin: 0; }
 .running-line { font-size: 14.5px; line-height: 1.9; font-variant-numeric: tabular-nums; }

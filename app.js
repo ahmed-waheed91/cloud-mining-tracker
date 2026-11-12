@@ -4,7 +4,7 @@
 // Data lives in a folder the user picks (File System Access API, Chrome): cloud-mining.json
 // plus daily backups. It is mirrored to localStorage so nothing is lost while disconnected.
 
-const APP_VERSION = '1.11.0';
+const APP_VERSION = '1.12.0';
 const DATA_VERSION = 4; // 3: deposits may have outside: true (paid straight for admin-added contracts); 4: sales
 const STORAGE_KEY = 'cloud-mining-data';
 const PREFS_KEY = 'cloud-mining-prefs';
@@ -694,8 +694,11 @@ function warnings(R) {
 // ---------- platform auto-reinvest and payout ----------
 const MIN_BLOCK_TH = 100;  // the platform's smallest reinvest block
 const MIN_PAYOUT = 0.001;  // the platform's smallest payout, BTC
-const REINVEST_FROM = { off: 'Off', capital: 'Capital only', profit: 'Profit only', both: 'Capital and profit' };
-const PAYOUT_FROM = { off: 'Off', profit: 'Profit only', capital: 'Capital only', everything: 'Everything' };
+const REINVEST_FROM = { off: 'Off', manual: 'Off: I buy by hand', capital: 'Capital only', profit: 'Profit only', both: 'Capital and profit' };
+const PAYOUT_FROM = { off: 'Off', manual: 'Off: I withdraw by hand', profit: 'Profit only', capital: 'Capital only', everything: 'Everything' };
+// "By hand" means the platform's auto setting is Off; the checks treat it as Off.
+const isManual = v => v === 'manual';
+const autoOf = v => (v === 'manual' ? 'off' : v || '');
 const blockCost = (th, price) => th * CONTRACT_DAYS * price;
 
 // Price of new hashrate in BTC per TH per day: what the user typed from the platform's reinvest page,
@@ -756,7 +759,7 @@ function replayCycle(c, def) {
   const lastEarn = days.at(-1)?.date;
   const autos = data.purchases.filter(p => isAutoReinvest(p) && p.allocBtc > 0 && inC(p.date));
   const pays = data.payouts.filter(p => inC(p.requested) && !isFailed(p.status));
-  const rf = c.reinvestFrom || '', pf = c.payoutFrom || '';
+  const rf = autoOf(c.reinvestFrom), pf = autoOf(c.payoutFrom);
   const blockTh = c.blockTh || MIN_BLOCK_TH;
   const threshold = Math.max(MIN_PAYOUT, c.withdrawThreshold || 0);
   const pool = { cap: 0, prof: 0 };
@@ -775,7 +778,10 @@ function replayCycle(c, def) {
     const buys = autos.filter(p => p.date === D);
     if (buys.length) {
       const th = sum(buys, 'th'), btc = sum(buys, 'allocBtc');
-      if (rf === 'off') { issues.push({ type: 'reinvestOff', date: D, th, btc }); take(['cap', 'prof'], btc); }
+      // Buys from before the user switched to buying by hand were made under a setting the app no longer has.
+      const before = isManual(c.reinvestFrom) && c.byHandSince && D < c.byHandSince;
+      if (rf === 'off' && !before) { issues.push({ type: 'reinvestOff', date: D, th, btc }); take(['cap', 'prof'], btc); }
+      else if (before) take(['cap', 'prof'], btc);
       else if (rf) {
         const src = POOLS[rf], have = avail(src);
         const blocks = th / blockTh, whole = Math.abs(blocks - Math.round(blocks)) < 1e-6 && Math.round(blocks) >= 1;
@@ -899,12 +905,12 @@ function platformWarnings(scope) {
   for (const [id, x] of P.cycles) {
     if (scope !== 'all' && scope !== id) continue;
     const { c } = x, name = esc(c.name);
-    const rf = c.reinvestFrom, pf = c.payoutFrom;
+    const rf = autoOf(c.reinvestFrom), pf = autoOf(c.payoutFrom);
     const block = th => `${th.toLocaleString('en-US')} TH/s`;
     const hint = 'Import the latest reports first; if it still shows, check the setting on the platform or ask them.';
     for (const i of x.issues) {
       const t = {
-        reinvestOff: () => ['warn', `Auto-reinvest bought ${block(i.th)} (${fmtAmtU(i.btc)}) on ${fmtDate(i.date)}, but auto-reinvest is Off in ${name}'s settings. Check the setting on the platform, then copy it on <b>Settings</b>.`],
+        reinvestOff: () => ['warn', `Auto-reinvest bought ${block(i.th)} (${fmtAmtU(i.btc)}) on ${fmtDate(i.date)}, but ${isManual(c.reinvestFrom) ? `${name} is set to buy by hand` : `auto-reinvest is Off in ${name}'s settings`}. Check the setting on the platform, then copy it on <b>Settings</b>.`],
         size: () => ['warn', `Auto-reinvest bought ${block(i.th)} on ${fmtDate(i.date)}: not a whole number of your ${block(c.blockTh || MIN_BLOCK_TH)} blocks. Check the block size on the platform matches ${name}'s settings.`],
         overR: () => ['warn', `Auto-reinvest on ${fmtDate(i.date)} spent ${fmtAmtU(i.btc)} on ${block(i.th)}, but only ${fmtAmtU(i.have)} of ${POOL_LABEL[rf]} was waiting. Is the platform still set to reinvest "${REINVEST_FROM[rf]}"?`],
         fewer: () => ['warn', `On ${fmtDate(i.date)} the ${POOL_LABEL[rf]} waiting (${fmtAmtU(i.have)}) covered ${i.expect} blocks, but auto-reinvest bought ${i.got}. ${hint}`],
@@ -930,7 +936,7 @@ function checkSummary(c) {
   const x = platformChecks().cycles.get(c.id);
   if (!x || !x.A.lastEarn) return '';
   const { A, issues, fit } = x;
-  const rf = c.reinvestFrom, pf = c.payoutFrom;
+  const rf = autoOf(c.reinvestFrom), pf = autoOf(c.payoutFrom);
   if (!(rf && rf !== 'off') && !(pf && pf !== 'off') && !x.autos) return '';
   const parts = [];
   const warnN = issues.filter(i => i.type !== 'source').length;
@@ -959,6 +965,91 @@ function checkSummary(c) {
   }
   const fitNote = fit === 'base' ? ' The platform counts the report\'s Base column as capital (and the bonus as profit): that is what fits its buys.' : fit === 'cost' ? ' The platform counts the report\'s Cost column as capital: that is what fits its buys.' : '';
   return `<div class="hint" style="margin:8px 0 0"><b>Checked against the reports</b>${help('Each day the app adds the day\'s capital and profit to two pots, takes off what auto-reinvest bought and what was paid out, and checks each step against your settings: whole blocks, no more than was waiting, nothing left undone for two days. Amounts waiting are counted with capital = the Base column, which is what fitted the platform\'s first auto-reinvest.' + fitNote)}<br>${parts.join('<br>')}</div>`;
+}
+
+// ---------- buying and withdrawing by hand ----------
+// With the platform's auto-reinvest and auto-payout off, the user splits the balance each day: capital goes back
+// into contracts, profit goes to the wallet.
+//  - Profit not taken out yet = the cycle's profit (Total − Cost, loss days included) − what was withdrawn.
+//  - More withdrawn than profit means capital went to the wallet (the platform's 11 Nov 2026 auto-payout).
+//    The user chose to refill that from profit first, so nothing counts as profit until it is made up.
+//    BTC sent back in ("Sent back from payouts" deposit) lowers the withdrawn figure, so it refills it too.
+//  - The rest of the balance is capital. Profit spent on contracts stays owed, and is paid out later from capital coming back.
+//  - The reports lag a day or two, so the user can type the balance the platform shows now. What it has on top of
+//    the reports' balance is split at the last 7 days' profit share, as an estimate until those reports are imported.
+function todayCycle() { const id = cycleIdForDate(todayIso()); return data.cycles.find(c => c.id === id) || null; }
+const doesByHand = c => !!c && (isManual(c.reinvestFrom) || isManual(c.payoutFrom));
+
+function manualSplit(c) {
+  const { m, days } = compute(c.id);
+  const recent = days.slice(-7), n = recent.length;
+  const rTotal = sum(recent, 'total'), rProfit = sum(recent, 'profit'), rCost = sum(recent, 'cost');
+  const share = rTotal > 0 ? Math.min(1, Math.max(0, rProfit / rTotal)) : 0;
+  let profitLeft = m.profit - m.withdrawn - m.carriedOut;
+  let bal = m.balance, asOf = m.last, extra = 0, live = null, extraProfit = 0;
+  const L = c.liveBalance;
+  if (L && L.btc >= 0 && isIso(L.date) && (!m.last || L.date > m.last)) {
+    live = L; extra = L.btc - m.balance; bal = L.btc; asOf = L.date;
+    if (extra > 0) { extraProfit = extra * share; profitLeft += extraProfit; }
+  }
+  bal = Math.max(0, bal);
+  const profit = Math.min(Math.max(profitLeft, 0), bal);
+  const capital = bal - profit;
+  const refill = Math.max(0, -profitLeft);
+  const bp = blockPriceInfo(c);
+  const th = bp ? Math.floor(capital / (CONTRACT_DAYS * bp.price) + 1e-9) : NaN;
+  const buyBtc = bp ? blockCost(th, bp.price) : NaN;
+  const minBuy = bp ? blockCost(MIN_BLOCK_TH, bp.price) : NaN;
+  const capPerDay = n ? rCost / n : NaN, profPerDay = n ? rProfit / n : NaN;
+  // While capital is being refilled, the day's profit goes to capital too.
+  const capDays = th >= MIN_BLOCK_TH ? 0 : capPerDay + (refill > 0 ? Math.max(0, profPerDay) : 0) > 0
+    ? Math.ceil((minBuy - capital) / (capPerDay + (refill > 0 ? Math.max(0, profPerDay) : 0))) : null;
+  const payDays = profit >= MIN_PAYOUT ? 0 : profPerDay > 0 ? Math.ceil((refill + MIN_PAYOUT - profit) / profPerDay) : null;
+  return { m, bal, asOf, live, extra, extraProfit, share, profit, capital, refill, bp, th, buyBtc, minBuy, capDays, payDays, capPerDay, profPerDay };
+}
+
+// "Today's split" on the Overview, for the cycle running today when its reinvest or payout is set to "by hand".
+function renderManual() {
+  const c = todayCycle();
+  if (!doesByHand(c)) return '';
+  const S = manualSplit(c);
+  const { bp } = S;
+  const unknown = !S.m.last && !S.live;
+  const asOfText = S.live ? `the balance you typed on ${fmtDate(S.live.date)}` : S.asOf ? `the reports up to ${fmtDate(S.asOf)}` : '';
+  const buyLine = !bp ? 'Type today\'s rate below to see how much hashrate that buys.'
+    : S.th >= MIN_BLOCK_TH ? `Buy <b>${S.th.toLocaleString('en-US')} TH/s</b> for ${fmtAmtU(S.buyBtc)}${fiat(S.buyBtc) ? ` (${fiat(S.buyBtc)})` : ''}${S.capital - S.buyBtc > 1e-8 ? `. ${fmtAmt(S.capital - S.buyBtc)} is left over for tomorrow.` : '.'}`
+    : `Not enough for the ${MIN_BLOCK_TH} TH/s minimum (${fmtAmtU(S.minBuy)}) yet${S.capDays ? `: about ${plural(S.capDays, 'day')} to go` : ''}.`;
+  const payLine = S.profit >= MIN_PAYOUT ? `Withdraw <b>${fmtAmtU(S.profit)}</b>${fiat(S.profit) ? ` (${fiat(S.profit)})` : ''}.`
+    : `Below the ${MIN_PAYOUT} BTC smallest payout${S.payDays ? `: about ${plural(S.payDays, 'day')} to go` : ''}.`;
+  const tile = (label, btc, line, helpText) => `<div class="mini">
+    <div class="label">${label} ${help(helpText)}</div>
+    <div class="v">${fmtAmt(btc)} <small>${unitLabel()}</small></div>
+    <div class="usd">${fiat(btc) ? '≈ ' + fiat(btc) : '&nbsp;'}</div>
+    <div class="todo">${line}</div></div>`;
+  const notes = [];
+  if (S.refill > 0) notes.push(`<b>${fmtAmtU(S.refill)}</b>${fiat(S.refill) ? ` (${fiat(S.refill)})` : ''} more was withdrawn than this cycle's profit, so that much capital went to your wallet. Profit goes back in as capital until it's made up${S.profPerDay > 0 ? `, about ${plural(Math.ceil(S.refill / S.profPerDay), 'day')} at the last 7 days' profit` : ''}. Sending BTC back in from your wallet (a "Sent back from payouts" deposit on Money in &amp; out) makes it up sooner.`);
+  if (S.live && S.extra > 1e-8) notes.push(`${fmtAmtU(S.extra)} of the balance you typed isn't in the imported reports yet. ${fmtAmt(S.extraProfit)} of it is counted as profit (${fmtPct(S.share, 1)}, the last 7 days' share). Import the reports to make it exact.`);
+  if (S.live && S.extra < -1e-8) notes.push(`The balance you typed is ${fmtAmtU(-S.extra)} below the reports' balance: a buy or payout that isn't in the imported reports yet? It's taken off the capital.`);
+  if (!S.live && S.m.last && S.m.last < addDays(todayIso(), -1)) notes.push(`The reports end on ${fmtDate(S.m.last)}. Type the balance the platform shows now for today's split.`);
+  const typed = S.live && S.live.date === todayIso() ? S.live : null;
+  return `<section class="hero manual">
+    <div class="panel-head"><h2 style="margin:0">Today's split</h2>
+      ${help('You buy and withdraw by hand (Settings → this cycle\'s reinvest and payout). Profit not taken out yet = this cycle\'s profit (Total − Cost from the daily report, loss days included) minus what you withdrew. Capital to put back = the rest of the balance. When the profit is spent on contracts, it is paid out later from the capital coming back.')}
+      <span class="hint" style="margin:0 0 0 auto">${unknown ? '' : `From ${asOfText}`}</span></div>
+    ${unknown ? '<p class="hint">Import the reports, or type the balance the platform shows now.</p>' : `<div class="hero-stats">
+      ${tile('Put back as capital', S.capital, buyLine, `Capital that came back from your contracts and is waiting on the balance${bp ? `. At ${bp.price.toFixed(12)} BTC per TH per day (${bp.src}), whole TH/s, at least ${MIN_BLOCK_TH}` : ''}.`)}
+      ${tile('Profit to withdraw', S.profit, payLine, `This cycle's profit that you haven't withdrawn yet, as far as the balance covers it. The platform's smallest payout is ${MIN_PAYOUT} BTC.`)}
+    </div>`}
+    ${notes.map(t => `<div class="hint" style="margin:10px 0 0">ℹ ${t}</div>`).join('')}
+    <form class="inline" data-form="live-balance" data-live-cycle="${c.id}" style="margin-top:14px">
+      <label>Balance on the platform now (BTC)<input type="number" name="btc" step="0.00000001" min="0" value="${typed ? typed.btc.toFixed(8) : ''}" style="width:140px"></label>
+      <label>or in USD<input type="number" name="usd" step="0.01" min="0" value="${typed?.usd ?? ''}" style="width:100px"></label>
+      <label>Today's rate (BTC per TH per day)<input type="number" name="rate" step="0.000000000001" min="0" value="${bp ? bp.price.toFixed(12) : ''}" style="width:170px"></label>
+      <button class="primary">Work it out</button>
+      ${S.live ? '<button type="button" data-act="live-clear">Clear the typed balance</button>' : ''}
+    </form>
+    ${bp?.stale ? `<div class="hint warn" style="margin:6px 0 0">The rate is ${bp.age != null ? plural(bp.age, 'day') + ' old' : 'old'}: type today's from the platform's buy page.</div>` : ''}
+  </section>`;
 }
 
 // Day-by-day model of the platform's loop. Each contract pays back 1/30 of its price plus profit every day for 30 days.
@@ -1214,12 +1305,13 @@ function renderOverview(R) {
   ${renderNotices(R)}
   <div class="cols charts-right ov"><div class="left">
   ${renderHero(R)}
+  ${renderManual()}
   ${renderRunning(R)}
 
   <h2>Right now</h2>
   <div class="stats">
     ${card('Capital working', m.working, { help: 'Price of all contracts active today.', sub: `${plural(m.activeCount, 'active contract')} · ${m.activeTh.toLocaleString('en-US')} TH/s` })}
-    ${card('Available balance', m.balance, { help: 'Calculated: money in − paid for contracts + received − withdrawn. Returned capital and profit waiting for the next reinvest block or payout.', sub: cyc?.reinvestFrom && cyc.reinvestFrom !== 'off' ? `Reinvests ${REINVEST_FROM[cyc.reinvestFrom].toLowerCase()} in ${(cyc.blockTh || MIN_BLOCK_TH).toLocaleString('en-US')} TH/s blocks${cyc.payoutFrom && cyc.payoutFrom !== 'off' ? ` · pays out ${PAYOUT_FROM[cyc.payoutFrom].toLowerCase()} at ${fmtAmt(cyc.withdrawThreshold || MIN_PAYOUT)}` : ''}` : '' })}
+    ${card('Available balance', m.balance, { help: 'Calculated: money in − paid for contracts + received − withdrawn. Returned capital and profit waiting for the next reinvest block or payout.', sub: autoOf(cyc?.reinvestFrom) && autoOf(cyc?.reinvestFrom) !== 'off' ? `Reinvests ${REINVEST_FROM[cyc.reinvestFrom].toLowerCase()} in ${(cyc.blockTh || MIN_BLOCK_TH).toLocaleString('en-US')} TH/s blocks${autoOf(cyc.payoutFrom) && autoOf(cyc.payoutFrom) !== 'off' ? ` · pays out ${PAYOUT_FROM[cyc.payoutFrom].toLowerCase()} at ${fmtAmt(cyc.withdrawThreshold || MIN_PAYOUT)}` : ''}` : '' })}
     ${lastCheck ? card('Balance check', checkDiff, { sign: true, tone: Math.abs(checkDiff) < 1e-6 ? 'pos' : 'warn', help: 'Your dashboard balance minus the calculated balance on that date. Small differences usually mean a payout that is not in the imported reports yet.', sub: `Dashboard ${fmtAmt(lastCheck.btc)} on ${fmtDate(lastCheck.date)}`, fiat: false }) : ''}
     ${card('Data up to', 0, { text: fmtDate(m.last), sub: plural(days.length, 'day') + ' of earnings' })}
   </div>
@@ -1640,7 +1732,8 @@ function projSetup(R) {
   const blockTh = proj.blockTh ?? cyc?.blockTh ?? MIN_BLOCK_TH;
   const block = blockCost(blockTh, blockPrice);
   const payoutAt = proj.payoutAt ?? cyc?.withdrawThreshold ?? MIN_PAYOUT;
-  const mine = cyc?.reinvestFrom || 'capital';
+  // Buying by hand is modelled as reinvesting capital every day.
+  const mine = isManual(cyc?.reinvestFrom) ? 'capital' : cyc?.reinvestFrom || 'capital';
   const start = m.last || todayIso();
   // Start from the contracts still running and the balance; a different capital scales them.
   let contracts = R.P.filter(p => p.end > start && !idleInfo(p)).map(p => ({ btc: contractValue(p), left: Math.min(CONTRACT_DAYS, daysBetween(start, p.end)) }));
@@ -1684,7 +1777,7 @@ function renderProjection(R) {
     return { ...s, be, leverage, at: d => ({ cap: cap[d], wd: wd[d] }) };
   });
   const mineRow = rows.find(r => r.mine);
-  const settingNote = cyc?.reinvestFrom ? 'your setting' : 'assumed: set yours in Settings';
+  const settingNote = isManual(cyc?.reinvestFrom) ? 'what you do by hand' : cyc?.reinvestFrom ? 'your setting' : 'assumed: set yours in Settings';
   // Biggest block the capital coming back can buy every day, with 5% headroom for loss days
   const fitTh = btcPerDay => Math.floor((0.95 * btcPerDay) / (CONTRACT_DAYS * blockPrice));
   const backNow = mineRow.p.back[1], backLater = mineRow.p.back[Math.min(days, CONTRACT_DAYS)];
@@ -2094,6 +2187,7 @@ function platformPanel(c) {
   const r = c.reinvestFrom, p = c.payoutFrom;
   const overlap = (r === 'both' && p && p !== 'off') || (r === 'capital' && (p === 'capital' || p === 'everything')) || (r === 'profit' && (p === 'profit' || p === 'everything'));
   if (overlap) notes.push('Reinvest and payout both use the same money; check which one the platform applies first.');
+  const byHand = isManual(r) || isManual(p);
   return `<form class="panel" data-form="cycle-settings" data-cycle="${c.id}" style="margin-top:10px">
     <div style="margin-bottom:8px"><b>${esc(c.name)}</b>: auto-reinvest and payout ${help('Copy what you set on the platform. The app uses these for the Projection tab and checks the platform\'s auto-reinvest buys and payouts against them; it never changes anything on the platform.')}</div>
     <div class="inline">
@@ -2106,6 +2200,7 @@ function platformPanel(c) {
     <div class="hint" style="margin:8px 0 0">${bp ? `One block of ${th.toLocaleString('en-US')} TH/s costs <b>${fmtAmtU(cost)}</b>${fiat(cost) ? ` (${fiat(cost)})` : ''} at ${bp.price.toFixed(12)} BTC per TH per day, <span class="${bp.stale ? 'warn' : ''}">${esc(bp.src)}${bp.stale && bp.age != null ? ` (${plural(bp.age, 'day')} old)` : ''}</span>.` : 'Import the hashrate purchases report, or type the block price from the platform.'}
       Leave the block price empty to use your latest contract's price; type the rate from the platform's reinvest page when it's newer.</div>
     ${notes.map(n => `<div class="hint warn" style="margin:4px 0 0">⚠ ${n}</div>`).join('')}
+    ${byHand ? `<div class="hint" style="margin:8px 0 0">"By hand" means the platform's setting is Off. ${todayCycle()?.id === c.id ? 'The Overview shows <b>Today\'s split</b>: how much of the balance is capital to put back and how much is profit to withdraw.' : 'Today\'s split shows on the Overview while this cycle is running.'} If the platform still buys or pays out on its own, the Overview warns you.</div>` : ''}
     ${checkSummary(c)}
   </form>`;
 }
@@ -2543,6 +2638,7 @@ function bind() {
     else if (act === 'ov-chart') setPref('ovChart', b.dataset.v);
     else if (act === 'run-win') setPref('runWin', b.dataset.v);
     else if (act === 'hide-notes') setPref('notesHidden', todayIso());
+    else if (act === 'live-clear') { const c = todayCycle(); if (c) { delete c.liveBalance; save(); render(); } }
     else if (act === 'hide-banner') setPref('bannerHidden', todayIso());
     else if (act === 'toggle-month') { const ym = b.dataset.ym; collapsedMonths.has(ym) ? collapsedMonths.delete(ym) : collapsedMonths.add(ym); render(); }
     else if (act === 'proj-reset') { resetProj(); render(); }
@@ -2616,6 +2712,8 @@ function bind() {
       c[f] = isNum ? (e.target.value === '' || !(num(e.target.value) >= 0) ? null : num(e.target.value)) : e.target.value;
       if (f === 'blockTh' && c.blockTh != null && c.blockTh < MIN_BLOCK_TH) { c.blockTh = MIN_BLOCK_TH; toast(`The platform's smallest block is ${MIN_BLOCK_TH} TH/s.`, true); }
       if (f === 'blockPrice') c.blockPriceDate = c.blockPrice > 0 ? todayIso() : null;
+      // Remember when "by hand" started, so the platform's earlier auto buys aren't flagged.
+      if ((f === 'reinvestFrom' || f === 'payoutFrom') && isManual(c[f]) && !c.byHandSince) c.byHandSince = todayIso();
       save(); render(); toast(`${c.name}: saved`);
     }
   });
@@ -2638,6 +2736,25 @@ function bind() {
       return;
     }
     if (form.dataset.form === 'cycle-settings') return; // fields save as they change
+    if (form.dataset.form === 'live-balance') {
+      const c = data.cycles.find(x => x.id === form.dataset.liveCycle);
+      if (!c) return;
+      const rate = num(f.rate), bp = blockPriceInfo(c);
+      if (rate > 0 && (!bp || Math.abs(rate - bp.price) > 1e-15)) { c.blockPrice = rate; c.blockPriceDate = todayIso(); }
+      // Whichever of BTC and USD was changed counts; a changed USD figure is converted at the live price.
+      const changed = n => form.elements[n].value !== form.elements[n].defaultValue;
+      const usd = num(f.usd) > 0 ? num(f.usd) : null;
+      let btc = f.btc !== '' && num(f.btc) >= 0 ? num(f.btc) : NaN, keepUsd = null;
+      if (usd && (changed('usd') || !(btc >= 0))) {
+        const price = usdPrice();
+        if (!(price > 0)) { toast('No BTC price yet (this needs an internet connection). Type the BTC amount instead.', true); return; }
+        btc = +(usd / price).toFixed(8); keepUsd = usd;
+      } else if (usd && !changed('btc')) keepUsd = usd;
+      if (btc >= 0 && (changed('btc') || changed('usd'))) c.liveBalance = { btc, usd: keepUsd, date: todayIso() };
+      else if (!(btc >= 0) && !(rate > 0)) { toast('Type the balance the platform shows, in BTC or USD.', true); return; }
+      save(); render();
+      return;
+    }
     if (form.dataset.form === 'deposit') {
       const rec = { id: uid(), cycleId: f.cycleId, date: f.date, btc: num(f.btc), usd: num(f.usd) > 0 ? num(f.usd) : null, kind: f.kind, note: f.note.trim() };
       if (num(f.btc) > 0) data.deposits.push(rec);
