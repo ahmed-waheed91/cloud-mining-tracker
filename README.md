@@ -31,6 +31,7 @@ Re-import whenever you like. Rows are refreshed, never doubled, and reinvestment
 - Projections that simulate the platform's loop day by day for each reinvest option, plus a block-size comparison showing how often blocks get bought, how much waits, and what bigger blocks cost you in profit
 - Deposits paid in USDT, taken straight from your purchase orders
 - Warnings for missing reports, stale data, loss streaks and bonus changes
+- Checks that the platform does what you set: auto-reinvest buys in whole blocks without spending more than was waiting, nothing bought or paid out late, and the daily report's own sums and capital paid back
 - Amounts in BTC or sats, with USD or AED alongside
 
 *This is a personal record-keeping tool, not financial advice.*

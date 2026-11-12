@@ -4,7 +4,7 @@
 // Data lives in a folder the user picks (File System Access API, Chrome): cloud-mining.json
 // plus daily backups. It is mirrored to localStorage so nothing is lost while disconnected.
 
-const APP_VERSION = '1.9.2';
+const APP_VERSION = '1.10.0';
 const DATA_VERSION = 3; // 3: deposits may have outside: true (paid straight for admin-added contracts)
 const STORAGE_KEY = 'cloud-mining-data';
 const PREFS_KEY = 'cloud-mining-prefs';
@@ -681,7 +681,11 @@ function warnings(R) {
   const hidden = hiddenBeforeFirstCycle();
   if (hidden) add('warn', hidden);
 
-  for (const p of R.W.filter(p => !isDone(p.status))) add('info', `Payout of ${fmtAmtU(p.btc)} requested on ${fmtDate(p.requested)} is still "${esc(p.status)}".`);
+  for (const p of R.W.filter(p => !isDone(p.status))) {
+    const age = daysBetween(p.requested, today);
+    add(age > 7 ? 'warn' : 'info', `Payout of ${fmtAmtU(p.btc)} requested on ${fmtDate(p.requested)} is still "${esc(p.status)}"${age > 7 ? ` after ${age} days. Ask the platform about it` : ''}.`);
+  }
+  for (const w of platformWarnings(R.scope)) add(w.level, w.text);
 
   return out;
 }
@@ -704,6 +708,256 @@ function blockPriceInfo(cycle) {
   if (!pick) return null;
   const age = pick.date ? daysBetween(pick.date, todayIso()) : null;
   return { ...pick, age, stale: age == null || age > 7 };
+}
+
+// ---------- does the platform do what it should? ----------
+// Two kinds of checks, both shown as Overview warnings and summed up on each cycle's Settings panel:
+//  1. The reports against themselves: each daily row's sums, the capital taken back against the contracts
+//     running, and contracts bought the same day at the same rate.
+//  2. Each cycle's auto-reinvest and auto-payout against the settings the user copied from the platform.
+//     A day-by-day replay keeps two pots, capital and profit, fed by each day's earnings. An auto-reinvest
+//     on day D can only spend what was waiting at the end of D−1 (the platform settles early the next day),
+//     must be whole blocks, and should buy as many blocks as the pot covers. A payout fires when its pot
+//     reaches the payout amount. The platform's own split isn't documented: on 10 Nov 2026 it fitted "capital
+//     = Base, profit = Bonus" (Base 0.00381441 bought 2 × 150 TH/s = 0.00379485, while Cost was 0.00370244).
+//     So the replay runs twice, with capital = Base and with capital = Cost, and something is only reported
+//     when it fails both ways. Buys get a day of grace for the timing, and "nothing happened" needs two days.
+const isAutoReinvest = p => /^auto-reinvest/i.test(p.contractId || '');
+const payoutKind = s => (/\ball\b|every/i.test(s || '') ? 'everything' : /profit/i.test(s || '') ? 'profit' : /capital/i.test(s || '') ? 'capital' : '');
+const POOLS = { capital: ['cap'], profit: ['prof'], both: ['cap', 'prof'], everything: ['prof', 'cap'] };
+const POOL_LABEL = { capital: 'capital', profit: 'profit', both: 'capital and profit', everything: 'balance' };
+const contractRate = p => p.allocBtc / p.th / (p.days || CONTRACT_DAYS);
+
+function dayTotals(keep) {
+  const m = new Map();
+  for (const r of data.earnings) {
+    if (!keep(r.date)) continue;
+    const x = m.get(r.date) || { date: r.date, base: 0, bonus: 0, total: 0, cost: 0, th: 0 };
+    x.base += r.baseBtc || 0; x.bonus += r.bonusBtc || 0; x.total += r.totalBtc || 0; x.cost += r.costBtc || 0; x.th += r.th || 0;
+    m.set(r.date, x);
+  }
+  return [...m.values()].sort(byDate);
+}
+// The price of new hashrate on a day: the latest contract bought by then, or the price typed for the cycle.
+function rateOn(c, date) {
+  const last = data.purchases.filter(p => p.th > 0 && p.allocBtc > 0 && p.date <= date)
+    .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : a.num - b.num)).at(-1);
+  const typed = c.blockPrice > 0 && (c.blockPriceDate || '') <= date ? c.blockPrice : NaN;
+  if (last && (!(typed > 0) || (c.blockPriceDate || '') < last.date)) return contractRate(last);
+  return typed > 0 ? typed : NaN;
+}
+
+// One replay of a cycle. `def` says what counts as capital: the report's 'base' or its 'cost'.
+function replayCycle(c, def) {
+  const inC = d => cycleIdForDate(d) === c.id;
+  const days = dayTotals(inC);
+  const byDay = new Map(days.map(d => [d.date, d]));
+  const lastEarn = days.at(-1)?.date;
+  const autos = data.purchases.filter(p => isAutoReinvest(p) && p.allocBtc > 0 && inC(p.date));
+  const pays = data.payouts.filter(p => inC(p.requested) && !isFailed(p.status));
+  const rf = c.reinvestFrom || '', pf = c.payoutFrom || '';
+  const blockTh = c.blockTh || MIN_BLOCK_TH;
+  const threshold = Math.max(MIN_PAYOUT, c.withdrawThreshold || 0);
+  const pool = { cap: 0, prof: 0 };
+  const avail = keys => sum(keys, k => pool[k]);
+  const take = (keys, amt) => {
+    for (const k of keys) { const t = Math.min(Math.max(pool[k], 0), amt); pool[k] -= t; amt -= t; }
+    if (amt > 0) pool[keys.at(-1)] -= amt;
+  };
+  const split = d => { const cap = def === 'base' ? d.base : d.cost; return { cap, prof: d.total - cap }; };
+  const todayIn = (d, keys) => { const e = byDay.get(d); if (!e) return 0; const s = split(e); return sum(keys, k => s[k]); };
+  const issues = [];
+  const missR = [], missP = [];
+  const dates = [...new Set([...days.map(d => d.date), ...autos.map(p => p.date), ...pays.map(p => p.requested)])].sort();
+  for (const D of dates) {
+    // Auto-reinvest bought on D (several contracts on one day count as one buy).
+    const buys = autos.filter(p => p.date === D);
+    if (buys.length) {
+      const th = sum(buys, 'th'), btc = sum(buys, 'allocBtc');
+      if (rf === 'off') { issues.push({ type: 'reinvestOff', date: D, th, btc }); take(['cap', 'prof'], btc); }
+      else if (rf) {
+        const src = POOLS[rf], have = avail(src);
+        const blocks = th / blockTh, whole = Math.abs(blocks - Math.round(blocks)) < 1e-6 && Math.round(blocks) >= 1;
+        if (!whole) issues.push({ type: 'size', date: D, th });
+        if (btc > have + todayIn(D, src) + 1e-7) issues.push({ type: 'overR', date: D, th, btc, have });
+        else if (whole) {
+          const expect = Math.floor((have + 1e-9) / (btc / Math.round(blocks)));
+          if (expect > Math.round(blocks)) issues.push({ type: 'fewer', date: D, th, have, expect, got: Math.round(blocks) });
+        }
+        take(src, btc);
+      } else take(['cap', 'prof'], btc);
+    }
+    // Payouts requested on D.
+    let autoPaid = false;
+    for (const p of pays.filter(x => x.requested === D)) {
+      const kind = payoutKind(p.source);
+      if (pf && pf !== 'off' && kind === pf) {
+        autoPaid = true;
+        const src = POOLS[pf], have = avail(src);
+        if (p.btc > have + todayIn(D, src) + 1e-7) issues.push({ type: 'overP', date: D, btc: p.btc, have, src: pf });
+        take(src, p.btc);
+      } else {
+        if (pf && pf !== 'off') issues.push({ type: 'source', date: D, btc: p.btc, source: p.source });
+        take(['prof', 'cap'], p.btc);
+      }
+    }
+    // Something should have happened on D, given what was waiting at the end of D−1 (once D's report is in).
+    if (lastEarn && D <= lastEarn) {
+      if (POOLS[rf] && rf !== 'everything' && !buys.length) {
+        const block = blockCost(blockTh, rateOn(c, D));
+        if (avail(POOLS[rf]) >= block - 1e-9) missR.push({ date: D, have: avail(POOLS[rf]), block });
+      }
+      if (pf && pf !== 'off' && !autoPaid && avail(POOLS[pf]) >= threshold - 1e-9) missP.push({ date: D, have: avail(POOLS[pf]) });
+    }
+    const e = byDay.get(D);
+    if (e) { const s = split(e); pool.cap += s.cap; pool.prof += s.prof; }
+  }
+  // Two days in a row with nothing done count as missed; report from the first one.
+  const streak = list => {
+    for (let i = 0; i < list.length - 1; i++) if (daysBetween(list[i].date, list[i + 1].date) === 1) return { ...list[i], days: list.length - i };
+    return null;
+  };
+  const mr = streak(missR), mp = streak(missP);
+  if (mr) issues.push({ type: 'missR', ...mr });
+  if (mp) issues.push({ type: 'missP', ...mp });
+  return { issues, pool: { ...pool }, autos: autos.length, autoPays: pays.filter(p => pf && pf !== 'off' && payoutKind(p.source) === pf).length, lastEarn, threshold, blockTh, days };
+}
+
+let checkMemo = null;
+function platformChecks() {
+  const key = [data.earnings.length, data.earnings.at(-1)?.date, sum(data.earnings, 'totalBtc'), data.purchases.map(p => p.num + ':' + p.allocBtc + ':' + p.date).join(),
+    data.payouts.map(p => p.requested + p.btc + p.status).join(), JSON.stringify(data.cycles)].join('|');
+  if (checkMemo?.data === data && checkMemo.key === key) return checkMemo.v;
+  const v = { report: [], cycles: new Map() };
+
+  // 1. The daily report's own sums.
+  const bad = [];
+  for (const r of data.earnings) {
+    const why = [];
+    if (Math.abs(r.totalBtc - r.baseBtc - r.bonusBtc) > 3e-8) why.push('Total ≠ Base + Bonus');
+    if (isFinite(r.bonusPct) && Math.abs(r.bonusBtc - r.baseBtc * r.bonusPct / 100) > 3e-8) why.push(`Bonus ≠ ${r.bonusPct}% of Base`);
+    if (Math.abs(r.profitBtc - (r.totalBtc - r.costBtc)) > 3e-8) why.push('Profit ≠ Total − Cost');
+    if (r.th > 0 && r.priceThDay > 0 && Math.abs(r.baseBtc - r.th * r.priceThDay) > Math.max(3e-8, r.baseBtc * 1e-5)) why.push('Base ≠ TH/s × price');
+    if (why.length) bad.push({ date: r.date, why });
+  }
+  if (bad.length) {
+    bad.sort(byDate);
+    const l = bad.at(-1);
+    v.report.push({ level: 'warn', text: `${plural(bad.length, 'row')} of the <b>daily earnings</b> report ${bad.length === 1 ? "doesn't" : "don't"} add up (latest ${fmtDate(l.date)}: ${l.why.join(', ')}). Ask the platform about it.` });
+  }
+
+  // Capital taken back each day = the running contracts' prices ÷ 30. First and last days are part-days, and
+  // contracts added by the admin or not mining have no known price, so those days are skipped.
+  const contracts = data.purchases.filter(p => p.contractId && p.th > 0);
+  const edges = new Set(contracts.flatMap(p => [p.start, p.end]));
+  const odd = contracts.filter(p => !(p.allocBtc > 0) || idleInfo(p));
+  const costOff = [];
+  for (const d of dayTotals(() => true)) {
+    if (edges.has(d.date)) continue;
+    const on = contracts.filter(p => p.start <= d.date && d.date <= p.end);
+    if (!on.length || on.some(p => odd.includes(p))) continue;
+    const expect = sum(on, p => p.allocBtc / (p.days || CONTRACT_DAYS));
+    if (Math.abs(d.cost - expect) > 1e-7 + on.length * 1e-8) costOff.push({ date: d.date, cost: d.cost, expect });
+  }
+  if (costOff.length) {
+    const l = costOff.at(-1);
+    v.report.push({ level: 'warn', text: `On ${plural(costOff.length, 'day')} the capital the report took back (Cost) isn't your running contracts' price ÷ 30 (latest ${fmtDate(l.date)}: ${fmtAmtU(l.cost)} taken back, ${fmtAmtU(l.expect)} expected). A contract may be missing from the <b>hashrate purchases</b> report, or the platform is paying back the wrong amount.` });
+  }
+
+  // (Same-day contracts don't always share one rate: an order paid in USDT gets its BTC at that moment's
+  // USD price, so the friend's #30/#31 differ by 0.17%. Not checked.)
+
+  // The mining part of the profit: Base above Cost. When Base only pays the capital back, the bonus is all the profit.
+  const all = dayTotals(() => true).filter(d => d.cost > 0);
+  let flat = 0;
+  for (let i = all.length - 1; i >= 0 && Math.abs(all[i].base - all[i].cost) <= Math.max(1e-7, all[i].cost * 1e-4); i--) flat++;
+  if (flat >= 2 && flat < all.length) {
+    const from = all[all.length - flat], l = all.at(-1);
+    v.report.push({ level: 'info', text: `Since ${fmtDate(from.date)} the mining part pays back exactly your capital (Base = Cost), so all your profit is the ${isFinite(l.bonus / l.base) ? fmtPct(l.bonus / l.base, 0) + ' ' : ''}bonus. Before, Base was above Cost.` });
+  }
+
+  // 2. Each cycle's auto-reinvest and payout.
+  for (const c of data.cycles) {
+    const A = replayCycle(c, 'base'), B = replayCycle(c, 'cost');
+    const keyOf = i => i.type + i.date;
+    const inB = new Set(B.issues.map(keyOf));
+    const issues = A.issues.filter(i => inB.has(keyOf(i)));
+    // Did one way of counting capital fit the buys and the other not? Then say which.
+    const fails = R => R.issues.filter(i => /^(overR|fewer)$/.test(i.type)).length;
+    const fit = !fails(A) && fails(B) ? 'base' : fails(A) && !fails(B) ? 'cost' : '';
+    v.cycles.set(c.id, { c, issues, A, fit, autos: A.autos, autoPays: A.autoPays });
+  }
+  checkMemo = { data, key, v };
+  return v;
+}
+
+// Warnings for one view: the report checks always, the cycle checks for the cycles in it.
+function platformWarnings(scope) {
+  const P = platformChecks();
+  const out = [...P.report];
+  for (const [id, x] of P.cycles) {
+    if (scope !== 'all' && scope !== id) continue;
+    const { c } = x, name = esc(c.name);
+    const rf = c.reinvestFrom, pf = c.payoutFrom;
+    const block = th => `${th.toLocaleString('en-US')} TH/s`;
+    const hint = 'Import the latest reports first; if it still shows, check the setting on the platform or ask them.';
+    for (const i of x.issues) {
+      const t = {
+        reinvestOff: () => ['warn', `Auto-reinvest bought ${block(i.th)} (${fmtAmtU(i.btc)}) on ${fmtDate(i.date)}, but auto-reinvest is Off in ${name}'s settings. Check the setting on the platform, then copy it on <b>Settings</b>.`],
+        size: () => ['warn', `Auto-reinvest bought ${block(i.th)} on ${fmtDate(i.date)}: not a whole number of your ${block(c.blockTh || MIN_BLOCK_TH)} blocks. Check the block size on the platform matches ${name}'s settings.`],
+        overR: () => ['warn', `Auto-reinvest on ${fmtDate(i.date)} spent ${fmtAmtU(i.btc)} on ${block(i.th)}, but only ${fmtAmtU(i.have)} of ${POOL_LABEL[rf]} was waiting. Is the platform still set to reinvest "${REINVEST_FROM[rf]}"?`],
+        fewer: () => ['warn', `On ${fmtDate(i.date)} the ${POOL_LABEL[rf]} waiting (${fmtAmtU(i.have)}) covered ${i.expect} blocks, but auto-reinvest bought ${i.got}. ${hint}`],
+        missR: () => ['warn', `Since ${fmtDate(i.date)} the ${POOL_LABEL[rf]} waiting (${fmtAmtU(i.have)}) has covered a ${block(c.blockTh || MIN_BLOCK_TH)} block (${fmtAmtU(i.block)}), but no auto-reinvest is in the reports. ${hint}`],
+        overP: () => ['warn', `The payout of ${fmtAmtU(i.btc)} on ${fmtDate(i.date)} is more than the ${POOL_LABEL[i.src]} that was waiting (${fmtAmtU(i.have)}). Is auto-payout still set to "${PAYOUT_FROM[i.src]}"?`],
+        missP: () => ['warn', `Since ${fmtDate(i.date)} the ${POOL_LABEL[pf]} waiting (${fmtAmtU(i.have)}) has reached your payout amount (${fmtAmtU(x.A.threshold)}), but no auto-payout is in the reports. ${hint}`],
+      }[i.type]?.();
+      if (t) out.push({ level: t[0], text: t[1] });
+    }
+    // Payouts whose Source isn't the auto-payout setting: one line for all of them.
+    const other = x.issues.filter(i => i.type === 'source');
+    if (other.length) {
+      const l = other.at(-1), labels = [...new Set(other.map(i => `"${esc(i.source)}"`))].join(', ');
+      out.push({ level: 'info', text: `${plural(other.length, 'payout')} in ${name} (latest ${fmtAmtU(l.btc)} on ${fmtDate(l.date)}) ${other.length === 1 ? 'has' : 'have'} the source ${labels}, not your auto-payout setting (${PAYOUT_FROM[pf]}), so the app treats ${other.length === 1 ? 'it' : 'them'} as asked for by hand. If an auto-payout shows up like this, the platform's setting may differ from yours.` });
+    }
+    if (x.autos && !rf) out.push({ level: 'info', text: `The platform made ${plural(x.autos, 'auto-reinvest buy')} in ${name}. Copy its auto-reinvest and payout settings on <b>Settings</b> so the app can check them.` });
+  }
+  return out;
+}
+
+// One line per cycle for its Settings panel: what was checked, and what is waiting for the next block or payout.
+function checkSummary(c) {
+  const x = platformChecks().cycles.get(c.id);
+  if (!x || !x.A.lastEarn) return '';
+  const { A, issues, fit } = x;
+  const rf = c.reinvestFrom, pf = c.payoutFrom;
+  if (!(rf && rf !== 'off') && !(pf && pf !== 'off') && !x.autos) return '';
+  const parts = [];
+  const warnN = issues.filter(i => i.type !== 'source').length;
+  parts.push(warnN ? `<span class="warn">⚠ ${plural(warnN, 'thing')} ${warnN === 1 ? "doesn't" : "don't"} match your settings: see the Overview.</span>`
+    : (() => {
+      const what = [rf && rf !== 'off' ? plural(x.autos, 'auto-reinvest buy') : '', pf && pf !== 'off' ? plural(x.autoPays, 'auto-payout') : ''].filter(Boolean);
+      const n = (rf && rf !== 'off' ? x.autos : 0) + (pf && pf !== 'off' ? x.autoPays : 0);
+      return n ? `✓ ${what.join(' and ')} up to ${fmtDate(A.lastEarn)} ${what.length === 1 && n === 1 ? 'matches' : 'match'} your settings.`
+        : `✓ Nothing was due up to ${fmtDate(A.lastEarn)}.`;
+    })());
+  const recent = A.days.slice(-7);
+  const perDay = (keys) => recent.length ? sum(recent, d => sum(keys, k => (k === 'cap' ? d.base : d.total - d.base))) / recent.length : NaN;
+  const eta = (have, need, keys, due) => {
+    if (have >= need) return `: ${due} is due next`;
+    const r = perDay(keys);
+    return r > 0 ? `, about ${plural(Math.ceil((need - have) / r), 'day')} to go` : '';
+  };
+  if (POOLS[rf] && rf !== 'everything') {
+    const bp = blockPriceInfo(c), need = bp ? blockCost(A.blockTh, bp.price) : NaN;
+    const have = sum(POOLS[rf], k => A.pool[k]);
+    if (isFinite(need)) parts.push(`${POOL_LABEL[rf][0].toUpperCase() + POOL_LABEL[rf].slice(1)} waiting for the next block: <b>${fmtAmtU(Math.max(0, have))}</b> of ${fmtAmtU(need)}${eta(have, need, POOLS[rf], `a buy of ${plural(Math.floor(have / need), 'block')}`)}.`);
+  }
+  if (pf && pf !== 'off') {
+    const have = sum(POOLS[pf], k => A.pool[k]);
+    parts.push(`${POOL_LABEL[pf][0].toUpperCase() + POOL_LABEL[pf].slice(1)} waiting for payout: <b>${fmtAmtU(Math.max(0, have))}</b> of ${fmtAmtU(A.threshold)}${eta(have, A.threshold, POOLS[pf], 'a payout')}.`);
+  }
+  const fitNote = fit === 'base' ? ' The platform counts the report\'s Base column as capital (and the bonus as profit): that is what fits its buys.' : fit === 'cost' ? ' The platform counts the report\'s Cost column as capital: that is what fits its buys.' : '';
+  return `<div class="hint" style="margin:8px 0 0"><b>Checked against the reports</b>${help('Each day the app adds the day\'s capital and profit to two pots, takes off what auto-reinvest bought and what was paid out, and checks each step against your settings: whole blocks, no more than was waiting, nothing left undone for two days. Amounts waiting are counted with capital = the Base column, which is what fitted the platform\'s first auto-reinvest.' + fitNote)}<br>${parts.join('<br>')}</div>`;
 }
 
 // Day-by-day model of the platform's loop. Each contract pays back 1/30 of its price plus profit every day for 30 days.
@@ -1737,7 +1991,7 @@ function platformPanel(c) {
   const overlap = (r === 'both' && p && p !== 'off') || (r === 'capital' && (p === 'capital' || p === 'everything')) || (r === 'profit' && (p === 'profit' || p === 'everything'));
   if (overlap) notes.push('Reinvest and payout both use the same money; check which one the platform applies first.');
   return `<form class="panel" data-form="cycle-settings" data-cycle="${c.id}" style="margin-top:10px">
-    <div style="margin-bottom:8px"><b>${esc(c.name)}</b>: auto-reinvest and payout ${help('Copy what you set on the platform. The app uses these for its calculations and the Projection tab; it never changes anything on the platform.')}</div>
+    <div style="margin-bottom:8px"><b>${esc(c.name)}</b>: auto-reinvest and payout ${help('Copy what you set on the platform. The app uses these for the Projection tab and checks the platform\'s auto-reinvest buys and payouts against them; it never changes anything on the platform.')}</div>
     <div class="inline">
       <label>Reinvest from<select name="reinvestFrom">${opts(REINVEST_FROM, c.reinvestFrom)}</select></label>
       <label>Block size (TH/s)<input type="number" name="blockTh" min="${MIN_BLOCK_TH}" step="1" value="${c.blockTh ?? ''}" placeholder="${MIN_BLOCK_TH}" style="width:100px"></label>
@@ -1748,6 +2002,7 @@ function platformPanel(c) {
     <div class="hint" style="margin:8px 0 0">${bp ? `One block of ${th.toLocaleString('en-US')} TH/s costs <b>${fmtAmtU(cost)}</b>${fiat(cost) ? ` (${fiat(cost)})` : ''} at ${bp.price.toFixed(12)} BTC per TH per day, <span class="${bp.stale ? 'warn' : ''}">${esc(bp.src)}${bp.stale && bp.age != null ? ` (${plural(bp.age, 'day')} old)` : ''}</span>.` : 'Import the hashrate purchases report, or type the block price from the platform.'}
       Leave the block price empty to use your latest contract's price; type the rate from the platform's reinvest page when it's newer.</div>
     ${notes.map(n => `<div class="hint warn" style="margin:4px 0 0">⚠ ${n}</div>`).join('')}
+    ${checkSummary(c)}
   </form>`;
 }
 
