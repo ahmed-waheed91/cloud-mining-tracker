@@ -4,8 +4,8 @@
 // Data lives in a folder the user picks (File System Access API, Chrome): cloud-mining.json
 // plus daily backups. It is mirrored to localStorage so nothing is lost while disconnected.
 
-const APP_VERSION = '1.10.0';
-const DATA_VERSION = 3; // 3: deposits may have outside: true (paid straight for admin-added contracts)
+const APP_VERSION = '1.11.0';
+const DATA_VERSION = 4; // 3: deposits may have outside: true (paid straight for admin-added contracts); 4: sales
 const STORAGE_KEY = 'cloud-mining-data';
 const PREFS_KEY = 'cloud-mining-prefs';
 const DATA_FILE = 'cloud-mining.json';
@@ -49,6 +49,7 @@ function emptyData() {
     // purchases may carry leaveOut: true (a contract that was not mining and was not paid for)
     deposits: [],      // {id, cycleId, date, btc, usd, kind: 'new'|'recycled' (withdrawn BTC sent back)|'carry', outside, orders, note}
     balanceChecks: [], // {id, date, btc, note}
+    sales: [],         // {id, date, btc, usd, note}: BTC from payouts sold for USDT (wallet side, not tied to a cycle)
     purchases: [],     // from hashrate-purchases report, one per order #
     earnings: [],      // from daily earnings report, one per group per day
     payouts: [],       // from payout report
@@ -1190,6 +1191,7 @@ function renderImportPanel() {
 function fmtPctPlain(v) { return fmtPct(v, 2); }
 
 function renderOverview(R) {
+  fetchDayPrices();
   const { m, days } = R;
   const isNew = !data.cycles.length && !data.earnings.length && !data.purchases.length;
   if (isNew) return renderWelcome();
@@ -1301,7 +1303,20 @@ function renderHero(R) {
       ${mini('Withdrawn to your wallet', m.withdrawn, m.recycled ? `Payouts sent to your own wallet (${fmtAmtU(m.paidOut)}), minus the ${fmtAmtU(m.recycled)} you sent back in to buy contracts.` : 'Payouts sent to your own wallet.', m.carriedOut ? `+ ${fmtAmt(m.carriedOut)} carried on` : m.recycled ? `${plural(R.W.length, 'payout')}, ${fmtAmt(m.recycled)} sent back` : plural(R.W.length, 'payout'))}
       ${mini('Still on the platform', m.onPlatform, `Your BTC that is still exposed to the platform: ${fmtAmtU(m.balance)} available balance plus ${fmtAmtU(m.outstanding)} of capital inside contracts that has not come back yet.`)}
     </div>
+    ${heroFiat(R)}
   </section>`;
+}
+
+// One line in the main card: what went in and where it stands today, in USD/AED.
+function heroFiat(R) {
+  const F = fiatPosition(R);
+  if (!F || !isFinite(F.result) || !(F.inV.usd > 0)) return '';
+  const e = F.est ? '~' : '';
+  return `<div class="hero-fiat"><span class="lead">In ${prefs.currency}</span>
+    <span>Put in <b>${e}${fmtMoney(F.inV.usd)}</b></span>
+    <span>Worth today <b>${fmtMoney(F.worth)}</b></span>
+    <span>Result <b class="${tone(F.result)}">${e}${F.result > 0.005 ? '+' : ''}${fmtMoney(F.result)}</b> (${fmtPct(F.result / F.inV.usd, 2, true)})</span>
+    ${help(`Money in at what it cost you. Worth today = ${F.soldBtc > 0 ? `what you sold for USDT (${fmtMoney(F.soldUsd)}) + ` : ''}BTC still in your wallet (${fmtMoney(F.held)}) + still on the platform (${fmtMoney(F.left + F.carryV.usd)}), at today's price. From mining ${fmtMoney(F.mining)}, from the BTC price ${fmtMoney(F.priceEffect)}${F.soldBtc > 0 ? `, from when you sold ${fmtMoney(F.saleEffect)}` : ''}. Details on Money in & out.`)}</div>`;
 }
 
 // One line on how the contracts are doing, for the window picked with the 7d / 30d / all switch.
@@ -1903,6 +1918,8 @@ function renderMoney(R) {
     ${payouts.length > 1 ? `<tr class="total"><td colspan="4">Total (${payouts.length})</td><td class="n">${fmtAmt(sum(payouts, 'btc'))}</td>${valueCells(sumUsd(payVals), sum(payouts, 'btc'), 'Includes estimates.')}<td></td></tr>` : ''}</tbody>
   </table></div>` : `<div class="empty">No payouts yet.</div>`}
 
+  ${renderSales()}
+
   <h2>Balance checks</h2>
   <p class="hint">Now and then, type in the available balance shown on the platform dashboard (in BTC). The app compares it with what the reports say it should be.</p>
   <form class="inline" data-form="check">
@@ -1929,32 +1946,119 @@ function renderMoney(R) {
   </div></div>`;
 }
 
-// The result in USD/AED: money in and out valued on the day they moved, what is left at today's price.
-function renderFiatResult(R) {
+// ---------- your wallet: BTC sold for USDT and BTC still held ----------
+// Payouts land in the wallet as lots. Sales (BTC sold for USDT) and BTC sent back to the platform use up
+// the oldest lots first. What is left of a lot is still held as BTC, so it is worth today's price; a sold
+// part is worth the USDT it fetched, for good. Everything in BTC stays as it is: this is the fiat side only.
+function walletLedger() {
+  const lots = data.payouts.filter(p => !isFailed(p.status))
+    .map(p => ({ p, date: payoutDate(p), scope: cycleIdForDate(p.requested), btc: p.btc, left: p.btc })).sort(byDate);
+  const uses = [
+    ...(data.sales || []).map(s => ({ kind: 'sale', s, date: s.date, btc: s.btc, usd: s.usd })),
+    ...data.deposits.filter(d => d.kind === 'recycled').map(d => ({ kind: 'back', d, date: d.date, btc: d.btc, scope: d.cycleId })),
+  ].sort(byDate);
+  const parts = [];
+  for (const u of uses) {
+    let need = u.btc;
+    for (const l of lots) {
+      if (need <= 1e-10) break;
+      const t = Math.min(l.left, need);
+      if (t <= 0) continue;
+      l.left -= t; need -= t;
+      parts.push({ lot: l, use: u, btc: t, usd: u.usd > 0 ? u.usd * t / u.btc : 0 });
+    }
+    u.unmatched = need > 1e-8 ? need : 0;
+  }
+  return { lots, uses, parts };
+}
+
+// Where the money stands in USD for a view. Money in at what it cost; sold BTC at the USDT it fetched;
+// BTC still in the wallet and on the platform at today's price. Balance carried to the next cycle, and BTC
+// sent back into another cycle, move at their value on that day (as money in for the cycle they went to).
+function fiatPosition(R) {
   const { m } = R;
   const price = usdPrice();
-  if (!R.D.length || !price) return '';
-  const nc = R.scope === 'all' ? null : nextCycle(R.scope);
+  if (!R.D.length || !price) return null;
+  const S = R.scope, inS = id => S === 'all' || id === S;
+  const L = walletLedger();
+  const nc = S === 'all' ? null : nextCycle(S);
   const carry = nc ? data.deposits.filter(d => d.cycleId === nc.id && d.kind === 'carry') : [];
-  // BTC sent back from payouts is taken off both sides, at its value on the day it was sent back.
-  const back = R.D.filter(d => d.kind === 'recycled').map(depositUsd).map(v => ({ ...v, usd: -v.usd }));
   const inV = sumUsd(R.D.filter(d => d.kind !== 'recycled').map(depositUsd));
-  const outV = sumUsd([...R.W.map(payoutUsd), ...carry.map(depositUsd), ...back]);
+  const carryV = sumUsd(carry.map(depositUsd));
+  const sales = L.parts.filter(x => x.use.kind === 'sale' && inS(x.lot.scope));
+  const soldBtc = sum(sales, 'btc'), soldUsd = sum(sales, 'usd');
+  const heldBtc = sum(L.lots.filter(l => inS(l.scope)), 'left');
+  const moved = [];
+  if (S !== 'all') {
+    for (const x of L.parts.filter(x => x.use.kind === 'back')) {
+      const fromHere = x.lot.scope === S, toHere = x.use.scope === S;
+      if (fromHere === toHere) continue;
+      const v = depositUsd(x.use.d);
+      moved.push({ usd: (fromHere ? 1 : -1) * v.usd * x.btc / x.use.btc, est: v.est });
+    }
+  }
+  const movedV = sumUsd(moved);
   const left = m.onPlatform * price;
-  const result = outV.usd + left - inV.usd;
-  const est = inV.est || outV.est;
+  const worth = soldUsd + heldBtc * price + left + carryV.usd + movedV.usd;
+  const result = worth - inV.usd;
+  const mining = m.net * price;
+  const saleEffect = soldUsd - soldBtc * price;
+  return {
+    price, inV, carryV, soldBtc, soldUsd, heldBtc, held: heldBtc * price, left, worth, result, mining, saleEffect,
+    priceEffect: result - mining - saleEffect, est: inV.est || carryV.est || movedV.est,
+    unmatched: sum(L.uses.filter(u => u.kind === 'sale'), 'unmatched'),
+  };
+}
+
+// Sales of payout BTC for USDT. Not tied to a cycle: they use up the oldest payouts first.
+function renderSales() {
+  const sales = (data.sales || []).slice().sort(byDate);
+  const L = walletLedger();
+  const price = usdPrice();
+  const held = sum(L.lots, 'left');
+  const over = sum(L.uses.filter(u => u.kind === 'sale'), 'unmatched');
+  const row = s => {
+    const now = price ? s.btc * price : NaN, diff = s.usd - now;
+    return `<tr><td>${fmtDate(s.date)}</td><td class="n">${fmtAmt(s.btc)}</td><td class="n">${fmtMoney(s.usd)}</td>
+      <td class="n">${fmtMoney(s.usd / s.btc)}</td><td class="n">${isFinite(now) ? fmtMoney(now) : '—'}</td><td class="n ${tone(diff)}">${isFinite(diff) ? (diff > 0.005 ? '+' : '') + fmtMoney(diff) : '—'}</td>
+      <td class="note">${esc(s.note)}</td><td class="actions"><button class="danger" data-act="del-sale" data-id="${s.id}">Delete</button></td></tr>`;
+  };
+  return `<h2>Sold for USDT</h2>
+  <p class="hint">When you sell payout BTC for USDT, record it here, so your result in ${prefs.currency} counts what it fetched instead of today's price. Sales use up your oldest payouts first. Your BTC figures don't change. ${help('A sale only changes the fiat side: the payouts still count as withdrawn in BTC. Type the USDT you actually received, after any fees.')}</p>
+  <form class="inline" data-form="sale">
+    <label>Date<input type="date" name="date" value="${todayIso()}" required></label>
+    <label>BTC sold<input type="number" name="btc" step="0.00000001" min="0" required style="width:150px"></label>
+    <label>USDT received<input type="number" name="usd" step="0.01" min="0" required style="width:130px"></label>
+    <label>Note<input name="note" style="width:200px"></label>
+    <button class="primary">Add sale</button>
+  </form>
+  <p class="hint" style="margin-top:8px">BTC from payouts still in your wallet: <b>${fmtAmtU(held)}</b>${price ? ` (${fmtMoney(held * price)} today)` : ''}.</p>
+  ${over > 0 ? `<div class="alert warn" style="margin:8px 0">⚠ <span>Your sales add up to ${fmtAmtU(over)} more than your payouts. Check the amounts; BTC that didn't come from the platform doesn't belong here.</span></div>` : ''}
+  ${sales.length ? `<div class="table-wrap"><table>
+    <thead><tr><th>Date</th><th class="n">BTC</th><th class="n">USDT</th><th class="n">Price</th><th class="n">${prefs.currency} now ${help('The same BTC at today\'s price.')}</th><th class="n">Difference ${help('What the sale fetched minus what that BTC would be worth today. Positive: you sold higher than today.')}</th><th>Note</th><th></th></tr></thead>
+    <tbody>${sales.map(row).join('')}
+    ${sales.length > 1 ? (() => { const b = sum(sales, 'btc'), u = sum(sales, 'usd'), now = price ? b * price : NaN; return `<tr class="total"><td>Total (${sales.length})</td><td class="n">${fmtAmt(b)}</td><td class="n">${fmtMoney(u)}</td><td class="n">${fmtMoney(u / b)}</td><td class="n">${isFinite(now) ? fmtMoney(now) : '—'}</td><td class="n ${tone(u - now)}">${isFinite(now) ? ((u - now) > 0.005 ? '+' : '') + fmtMoney(u - now) : '—'}</td><td></td><td></td></tr>`; })() : ''}</tbody>
+  </table></div>` : ''}`;
+}
+
+// The result in USD/AED.
+function renderFiatResult(R) {
+  const F = fiatPosition(R);
+  if (!F) return '';
+  const { m } = R, est = F.est;
   // ~ marks a figure that includes estimates
   const t = (v, e = est) => (isFinite(v) ? (e ? '~' : '') + fmtMoney(v) : '—');
   const sign = (v, e = est) => (isFinite(v) && v > 0.005 ? (e ? '~+' : '+') + fmtMoney(v) : t(v, e));
-  const mining = m.net * price;
+  const ok = isFinite(F.result);
   return `<h2>Your result in ${prefs.currency}</h2>
   <div class="grid">
-    ${card('Money in', 0, { text: t(inV.usd, inV.est), help: 'Your deposits, valued on the day you sent them: the USD/USDT you paid, else that day\'s average BTC price.', sub: fmtAmtU(m.in) })}
-    ${card('Withdrawn', 0, { text: t(outV.usd, outV.est), help: 'Payouts valued on the day they reached your wallet' + (carry.length ? ', plus the balance carried to the next cycle on that day' : '') + '.', sub: fmtAmtU(m.withdrawn + m.carriedOut) })}
-    ${card('Still on the platform', 0, { text: fmtMoney(left), help: 'Your balance and the capital still in contracts, at today\'s BTC price.', sub: fmtAmtU(m.onPlatform) })}
-    ${card('Result', 0, { text: sign(result), tone: tone(result), help: 'Withdrawn + still on the platform − money in, all in ' + prefs.currency + '.', sub: isFinite(result) && inV.usd > 0 ? `${fmtPct(result / inV.usd, 2, true)} of money in` : '' })}
+    ${card('Money in', 0, { text: t(F.inV.usd, F.inV.est), help: 'Your deposits, valued on the day you sent them: the USD/USDT you paid, else that day\'s average BTC price.', sub: fmtAmtU(m.in) })}
+    ${F.soldBtc > 0 ? card('Sold for USDT', 0, { text: fmtMoney(F.soldUsd), help: 'Payouts you sold for USDT, at what you got for them. This amount is fixed: it no longer moves with the BTC price.', sub: fmtAmtU(F.soldBtc) }) : ''}
+    ${card('BTC in your wallet', 0, { text: fmtMoney(F.held), help: 'Payouts you haven\'t recorded as sold (or sent back), at today\'s BTC price. Record a sale below when you sell some for USDT.', sub: fmtAmtU(F.heldBtc) })}
+    ${card('Still on the platform', 0, { text: fmtMoney(F.left + F.carryV.usd), help: 'Your balance and the capital still in contracts, at today\'s BTC price.' + (F.carryV.usd ? ' Plus the balance carried to the next cycle, at its value on that day.' : ''), sub: fmtAmtU(m.onPlatform + m.carriedOut) })}
+    ${card('Result', 0, { text: sign(F.result), tone: tone(F.result), help: `What you have now (sold + in your wallet + on the platform) − money in, all in ${prefs.currency}.`, sub: ok && F.inV.usd > 0 ? `${fmtPct(F.result / F.inV.usd, 2, true)} of money in` : '' })}
   </div>
-  ${isFinite(result) ? `<p class="hint" style="margin-top:8px">Of which <b>from mining</b>: ${sign(mining, false)} (your net ${fmtAmtU(m.net, true)} at today's price) · <b>from the BTC price moving</b>: ${sign(result - mining)}.${est ? ' ~ = includes estimates from daily average prices.' : ''}</p>` : '<p class="hint" style="margin-top:8px">Waiting for the BTC prices of those days (this needs an internet connection).</p>'}`;
+  ${ok ? `<p class="hint" style="margin-top:8px">Of which <b>from mining</b>: ${sign(F.mining, false)} (your net ${fmtAmtU(m.net, true)} at today's price) · <b>from the BTC price moving</b>: ${sign(F.priceEffect)}${F.soldBtc > 0 ? ` · <b>from when you sold</b>: ${sign(F.saleEffect, false)} ${help('What your sales fetched compared with the same BTC at today\'s price. Positive: you sold higher than today.')}` : ''}.${est ? ' ~ = includes estimates from daily average prices.' : ''}</p>` : '<p class="hint" style="margin-top:8px">Waiting for the BTC prices of those days (this needs an internet connection).</p>'}`;
 }
 
 // What belongs to a cycle by date, and what is dated before the first cycle (so no cycle view shows it).
@@ -2314,7 +2418,7 @@ async function fetchDayPrices() {
       const byDay = new Map(candles.map(([t, lo, hi, op, cl]) => [new Date(t * 1000).toISOString().slice(0, 10), (lo + hi + op + cl) / 4]));
       for (; i < need.length && need[i] <= to; i++) dayPrices[need[i]] = byDay.get(need[i]) ?? null;
     }
-    if (['contracts', 'money'].includes(currentTab) && !document.activeElement?.closest('form, tr[data-edit]')) render();
+    if (['overview', 'contracts', 'money'].includes(currentTab) && !document.activeElement?.closest('form, tr[data-edit]')) render();
   } catch { /* offline: those amounts show — until the next try */ }
   finally { dayPricesBusy = false; }
 }
@@ -2479,6 +2583,7 @@ function bind() {
       }
     }
     else if (act === 'del-deposit' && confirm('Delete this deposit?')) { data.deposits = data.deposits.filter(d => d.id !== id); save(); render(); }
+    else if (act === 'del-sale' && confirm('Delete this sale?')) { data.sales = data.sales.filter(s => s.id !== id); save(); render(); }
     else if (act === 'del-check' && confirm('Delete this balance check?')) { data.balanceChecks = data.balanceChecks.filter(d => d.id !== id); save(); render(); }
     else if (act === 'del-cycle') {
       const deps = data.deposits.filter(d => d.cycleId === id).length;
@@ -2584,6 +2689,10 @@ function bind() {
         btc: +sum(ps, 'allocBtc').toFixed(8), usd: +sum(ps, 'allocUsd').toFixed(2), kind: 'new', orders: nums,
         note: `Paid in USDT for order${nums.length > 1 ? 's' : ''} #${nums.join(', #')}`,
       });
+    } else if (form.dataset.form === 'sale') {
+      if (!(num(f.btc) > 0) || !(num(f.usd) > 0)) { toast('Type the BTC sold and the USDT received.', true); return; }
+      data.sales.push({ id: uid(), date: f.date, btc: num(f.btc), usd: num(f.usd), note: f.note.trim() });
+      toast(`Sale added: ${fmtAmtU(num(f.btc))} for ${fmtMoney(num(f.usd))}`);
     } else if (form.dataset.form === 'check') {
       data.balanceChecks.push({ id: uid(), date: f.date, btc: num(f.btc), note: f.note.trim() });
     } else if (form.dataset.form === 'cycle') {

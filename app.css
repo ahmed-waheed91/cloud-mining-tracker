@@ -276,6 +276,10 @@ button.link.quiet { color: var(--muted); font-size: 12.5px; }
 .mini .v { font-size: 16px; font-weight: 600; margin-top: 3px; font-variant-numeric: tabular-nums; }
 .mini .v small { color: var(--muted); font-weight: 500; font-size: 12px; }
 .mini .usd { font-size: 12.5px; }
+.hero-fiat { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 22px; margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--border); font-size: 13.5px; color: var(--muted); }
+.hero-fiat b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+.hero-fiat b.pos { color: var(--pos); } .hero-fiat b.neg { color: var(--neg); }
+.hero-fiat .lead { font-weight: 600; color: var(--text); }
 
 .running-head { display: flex; align-items: center; gap: 12px; justify-content: space-between; margin: 28px 0 8px; }
 .running-head h2 { margin: 0; }
